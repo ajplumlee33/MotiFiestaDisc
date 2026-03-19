@@ -8,6 +8,7 @@ from torch_geometric.data import DataLoader
 
 from MotiFiesta.utils.synthetic import SyntheticMotifs
 from MotiFiesta.utils.real_world import RealWorldDataset
+from MotiFiesta.utils.syslev_ds import SysLevDataset
 
 
 def get_loader(root,
@@ -30,15 +31,25 @@ def get_loader(root,
         Dictionary with loaders and datasets for train/test 
 
     """
-    if not name.startswith('synth'):
-        if name == 'IMDB-BINARY':
-            dataset = RealWorldDataset(root=root, max_degree=300, n_features=301)
-        else:
-            dataset = RealWorldDataset(root=root)
+    if root.startswith('./data/mips_torch'):
+        dataset = SysLevDataset(root=root)
     else:
-        dataset = SyntheticMotifs(root=root, name=name, **kwargs)
-    lengths = [math.floor(len(dataset) * .8), math.ceil(len(dataset) * .2)]
-    train_data, test_data = random_split(dataset, lengths, generator=torch.Generator().manual_seed(42))
+        if not name.startswith('synth'):
+            if name == 'IMDB-BINARY':
+                dataset = RealWorldDataset(root=root, max_degree=300, n_features=301)
+            else:
+                dataset = RealWorldDataset(root=root)
+        else:
+            dataset = SyntheticMotifs(root=root, name=name, **kwargs)
+    if len(dataset) <= 1:
+        # for a systems-level graph, we don't split the dataset
+        # we return the same dataset for both, but use masks for train/test
+        train_data = dataset
+        test_data = dataset 
+        print("systems-level graph detected: skipping dataset split")
+    else:
+        lengths = [math.floor(len(dataset) * .8), math.ceil(len(dataset) * .2)]
+        train_data, test_data = random_split(dataset, lengths, generator=torch.Generator().manual_seed(42))
     loader_train = DataLoader(train_data, batch_size=batch_size, shuffle=True)
     loader_test = DataLoader(test_data, batch_size=batch_size, shuffle=True)
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=False)

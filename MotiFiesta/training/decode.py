@@ -54,9 +54,23 @@ class HashDecoder(Decoder):
         elif n_children == 1:
             return HashDecoder.total_sigma(level-1, children[0], tree, sigmas, ee)
         else:
-            eind = (ee[level-1][0] == children[0]) &\
-                   (ee[level-1][1] == children[1])
-            eind = eind.nonzero()[0][0].item()
+            #eind = (ee[level-1][0] == children[0]) &\
+            #       (ee[level-1][1] == children[1])
+            #eind = eind.nonzero()[0][0].item()
+            # replace it with this safety check:
+            # convert sets to lists, then to tensors
+            # this bypasses the 'dtype of set' error
+            tree_0 = torch.as_tensor(list(tree[level-1][0]))
+            tree_1 = torch.as_tensor(list(tree[level-1][1]))
+
+            # proceed with the mask and nonzero check
+            eind_mask = (tree_0 == node) | (tree_1 == node)
+            valid_indices = eind_mask.nonzero()
+
+            if valid_indices.numel() == 0:
+                return 0 
+
+            eind = valid_indices[0][0].item()
             score = sigmas[level-1][eind]
             # get score for this node
             return score +\
