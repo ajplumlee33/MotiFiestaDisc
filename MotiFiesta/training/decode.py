@@ -57,9 +57,9 @@ class HashDecoder(Decoder):
             #eind = (ee[level-1][0] == children[0]) &\
             #       (ee[level-1][1] == children[1])
             #eind = eind.nonzero()[0][0].item()
-            # replace it with this safety check:
+
             # convert sets to lists, then to tensors
-            # this bypasses the 'dtype of set' error
+            # bypasses the 'dtype of set' error
             tree_0 = torch.as_tensor(list(tree[level-1][0]))
             tree_1 = torch.as_tensor(list(tree[level-1][1]))
 

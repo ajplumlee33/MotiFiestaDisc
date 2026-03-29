@@ -2,9 +2,8 @@ import torch
 import pandas as pd
 import os.path as osp
 from torch_geometric.data import Data, Dataset
-from torch_geometric.utils import coalesce, remove_isolated_nodes
 
-class SysLevDataset(Dataset):
+class SysTxtDataset(Dataset):
     def __init__(self, root, transform=None, pre_transform=None):
         super().__init__(root, transform, pre_transform)
 
@@ -14,7 +13,7 @@ class SysLevDataset(Dataset):
 
     @property
     def processed_file_names(self):
-        # caching both the real and the rewired null graph
+        # cache both the real and the rewired null graph
         return ['real_graph.pt', 'null_graph.pt']
 
     def process(self):
@@ -23,7 +22,7 @@ class SysLevDataset(Dataset):
         df = pd.read_csv(self.raw_paths[0], sep=None, engine='python', comment='#', header=None)
         
         # establish the master node list from both columns to cover all proteins
-        # converting to strings ensures consistent mapping
+        # convert to strings for consistent mapping
         nodes = pd.concat([df[0], df[1]]).astype(str).unique()
         node_map = {n: i for i, n in enumerate(nodes)}
         num_nodes = len(nodes)
@@ -38,14 +37,14 @@ class SysLevDataset(Dataset):
         x = torch.randn((num_nodes, 25)) * 0.1
         
         # create a unique lookup map for protein sizes and categories
-        # we take the first instance of each protein to avoid duplicate label errors
+        # take the first instance of each protein to avoid duplicate label errors
         feature_map = df[[0, 2, 4]].drop_duplicates(subset=[0]).set_index(0)
 
         # map features to nodes and fill missing values (orphans) with 0
         node_to_size = feature_map[4].reindex(nodes).fillna(0)
         node_to_cat = feature_map[2].astype(str).apply(hash).reindex(nodes).fillna(0)
 
-        # fill the first two slots of our 25-dim tensor
+        # fill the first two slots of 25-dim tensor
         x[:, 0] = torch.tensor(node_to_size.values, dtype=torch.float) / 100.0
         x[:, 1] = torch.tensor(node_to_cat.values, dtype=torch.float) % 10
 

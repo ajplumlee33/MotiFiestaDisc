@@ -8,7 +8,7 @@ from torch_geometric.data import DataLoader
 
 from MotiFiesta.utils.synthetic import SyntheticMotifs
 from MotiFiesta.utils.real_world import RealWorldDataset
-from MotiFiesta.utils.syslev_ds import SysLevDataset
+from MotiFiesta.utils.sys_txt import SysTxtDataset
 
 
 def get_loader(root,
@@ -32,7 +32,7 @@ def get_loader(root,
 
     """
     if root.startswith('./data/mips_torch'):
-        dataset = SysLevDataset(root=root)
+        dataset = SysTxtDataset(root=root)
     else:
         if not name.startswith('synth'):
             if name == 'IMDB-BINARY':
@@ -42,8 +42,8 @@ def get_loader(root,
         else:
             dataset = SyntheticMotifs(root=root, name=name, **kwargs)
     if len(dataset) <= 1:
-        # for a systems-level graph, we don't split the dataset
-        # we return the same dataset for both, but use masks for train/test
+        # no split for a systems-level graph
+        # same dataset for both, masks for train/test
         train_data = dataset
         test_data = dataset 
         print("systems-level graph detected: skipping dataset split")
