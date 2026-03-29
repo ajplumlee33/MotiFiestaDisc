@@ -9,6 +9,7 @@ from torch_geometric.data import DataLoader
 from MotiFiesta.utils.synthetic import SyntheticMotifs
 from MotiFiesta.utils.real_world import RealWorldDataset
 from MotiFiesta.utils.sys_txt import SysTxtDataset
+from MotiFiesta.utils.sys_loader import SysLoader
 
 
 def get_loader(root,
@@ -47,12 +48,15 @@ def get_loader(root,
         train_data = dataset
         test_data = dataset 
         print("systems-level graph detected: skipping dataset split")
+        loader_train = SysLoader(train_data, batch_size=batch_size, shuffle=True)
+        loader_test = SysLoader(test_data, batch_size=batch_size, shuffle=True)
+        loader = SysLoader(dataset, batch_size=batch_size, shuffle=False)
     else:
         lengths = [math.floor(len(dataset) * .8), math.ceil(len(dataset) * .2)]
         train_data, test_data = random_split(dataset, lengths, generator=torch.Generator().manual_seed(42))
-    loader_train = DataLoader(train_data, batch_size=batch_size, shuffle=True)
-    loader_test = DataLoader(test_data, batch_size=batch_size, shuffle=True)
-    loader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
+        loader_train = DataLoader(train_data, batch_size=batch_size, shuffle=True)
+        loader_test = DataLoader(test_data, batch_size=batch_size, shuffle=True)
+        loader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
     return {'dataset_whole': dataset, 'loader_whole': loader, 'loader_train': loader_train, 'loader_test': loader_test}
 
 
