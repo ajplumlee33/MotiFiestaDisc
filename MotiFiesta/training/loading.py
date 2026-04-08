@@ -32,9 +32,11 @@ def get_loader(root,
         Dictionary with loaders and datasets for train/test 
 
     """
-    if root.startswith('./data/mips_torch'):
+    if 'mips_torch' in root:
+        print(">>> SUCCESS: Systems dataset detected")
         dataset = SysTxtDataset(root=root)
     else:
+        print(">>> FAIL: Falling back to RealWorldDataset")
         if not name.startswith('synth'):
             if name == 'IMDB-BINARY':
                 dataset = RealWorldDataset(root=root, max_degree=300, n_features=301)
@@ -45,12 +47,18 @@ def get_loader(root,
     if len(dataset) <= 1:
         # no split for a systems-level graph
         # same dataset for both, masks for train/test
-        train_data = dataset
-        test_data = dataset 
         print("systems-level graph detected: skipping dataset split")
-        loader_train = SysLoader(train_data, batch_size=batch_size, shuffle=True)
-        loader_test = SysLoader(test_data, batch_size=batch_size, shuffle=True)
-        loader = SysLoader(dataset, batch_size=batch_size, shuffle=False)
+        # calculate split indices
+        num_nodes = dataset[0].num_nodes
+        indices = torch.randperm(num_nodes)
+        split_idx = int(num_nodes * 0.8)
+
+        train_idx = indices[:split_idx]
+        test_idx = indices[split_idx:]
+
+        loader_train = SysLoader(dataset[0], input_nodes=train_idx, batch_size=batch_size, shuffle=True)
+        loader_test = SysLoader(dataset[0], input_nodes=test_idx, batch_size=batch_size, shuffle=True)
+        loader = SysLoader(dataset[0], batch_size=batch_size, shuffle=False)
     else:
         lengths = [math.floor(len(dataset) * .8), math.ceil(len(dataset) * .2)]
         train_data, test_data = random_split(dataset, lengths, generator=torch.Generator().manual_seed(42))
