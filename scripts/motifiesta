@@ -11,6 +11,7 @@ warnings.simplefilter("ignore", UserWarning)
 from MotiFiesta.training.model import MotiFiestaModel
 from MotiFiesta.training.loading import get_loader
 from MotiFiesta.training.train import motif_train
+from MotiFiesta.training.sys_train import sys_train
 from MotiFiesta.utils.learning_utils import dump_model_hparams
 from MotiFiesta.utils.learning_utils import load_model
 from MotiFiesta.utils.learning_utils import load_data
@@ -34,6 +35,7 @@ if function == 'train':
     parser.add_argument("--dataset", "-da", type=str, default='synthetic')
     parser.add_argument("--data_root", type=str, default='.')
     parser.add_argument("--restart", "-r", action='store_true', default=False,  help='Restart model.')
+    parser.add_argument("--disc", "-di", action='store_true', default=False,  help='Discovery mode.')
 
     # training  loop
     parser.add_argument("--batch-size", "-b", type=int, default=16)
@@ -112,21 +114,40 @@ if function == 'train':
     print(model)
 
     print(">>> training...")
-    motif_train(model,
-                train_loader=data['loader_train'],
-                test_loader=data['loader_test'],
-                model_name=args.name,
-                epochs=args.epochs,
-                max_batches=args.max_batches,
-                stop_epochs=args.stop_epochs,
-                estimator=args.estimator,
-                volume=args.volume,
-                n_neighbors=args.n_neighbors,
-                hard_embed=args.hard_embed,
-                beta=args.beta,
-                lam=args.lam,
-                epoch_start=epoch_start,
-                optimizer=optimizer,
-                controller_state=controller_state
-                )
-
+    if not args.disc:
+        motif_train(model,
+                    train_loader=data['loader_train'],
+                    test_loader=data['loader_test'],
+                    model_name=args.name,
+                    epochs=args.epochs,
+                    max_batches=args.max_batches,
+                    stop_epochs=args.stop_epochs,
+                    estimator=args.estimator,
+                    volume=args.volume,
+                    n_neighbors=args.n_neighbors,
+                    hard_embed=args.hard_embed,
+                    beta=args.beta,
+                    lam=args.lam,
+                    epoch_start=epoch_start,
+                    optimizer=optimizer,
+                    controller_state=controller_state
+                    )
+    else:
+        sys_train(model,
+                    train_loader=data['loader_train'],
+                    test_loader=data['loader_test'],
+                    master_data=data['dataset_whole'],
+                    model_name=args.name,
+                    epochs=args.epochs,
+                    max_batches=args.max_batches,
+                    stop_epochs=args.stop_epochs,
+                    estimator=args.estimator,
+                    volume=args.volume,
+                    n_neighbors=args.n_neighbors,
+                    hard_embed=args.hard_embed,
+                    beta=args.beta,
+                    lam=args.lam,
+                    epoch_start=epoch_start,
+                    optimizer=optimizer,
+                    controller_state=controller_state
+                    )

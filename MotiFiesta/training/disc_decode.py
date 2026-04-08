@@ -31,7 +31,7 @@ class Decoder:
         """ Computes jaccard score for a model."""
         raise NotImplementedError
 
-class HashDecoder(Decoder):
+class DiscHashDecoder(Decoder):
     def __init__(self, model_id, dataset_id, hash_dim=4, dummy=False, level=2):
         self.level = level
         self.dummy = dummy
@@ -52,16 +52,30 @@ class HashDecoder(Decoder):
         if n_children == 0:
             return 0
         elif n_children == 1:
-            return HashDecoder.total_sigma(level-1, children[0], tree, sigmas, ee)
+            return DiscHashDecoder.total_sigma(level-1, children[0], tree, sigmas, ee)
         else:
-            eind = (ee[level-1][0] == children[0]) &\
-                   (ee[level-1][1] == children[1])
-            eind = eind.nonzero()[0][0].item()
+            #eind = (ee[level-1][0] == children[0]) &\
+            #       (ee[level-1][1] == children[1])
+            #eind = eind.nonzero()[0][0].item()
+
+            # convert sets to lists, then to tensors
+            # bypasses the 'dtype of set' error
+            tree_0 = torch.as_tensor(list(tree[level-1][0]))
+            tree_1 = torch.as_tensor(list(tree[level-1][1]))
+
+            # proceed with the mask and nonzero check
+            eind_mask = (tree_0 == node) | (tree_1 == node)
+            valid_indices = eind_mask.nonzero()
+
+            if valid_indices.numel() == 0:
+                return 0 
+
+            eind = valid_indices[0][0].item()
             score = sigmas[level-1][eind]
             # get score for this node
             return score +\
-                   HashDecoder.total_sigma(level-1, children[0], tree, sigmas, ee) +\
-                   HashDecoder.total_sigma(level-1, children[1], tree, sigmas, ee)
+                   DiscHashDecoder.total_sigma(level-1, children[0], tree, sigmas, ee) +\
+                   DiscHashDecoder.total_sigma(level-1, children[1], tree, sigmas, ee)
 
 
     def decode(self, n_graphs=-1):
@@ -84,7 +98,7 @@ class HashDecoder(Decoder):
         for idx, g_pair in enumerate(self.dataset['dataset_whole']):
             if idx > n_graphs and n_graphs > -1:
                 break
-            g = g_pair['pos']
+            g = g_pair['pos'] if isinstance(g_pair, dict) else g_pair
             g_hashes = [''] * len(g.x)
 
             batch = torch.zeros(len(g.x), dtype=torch.long)
@@ -103,7 +117,7 @@ class HashDecoder(Decoder):
                 all_hashes.append(None)
                 all_spotlights.append(None)
                 continue
-            g = to_networkx(g_pair['pos'])
+            g = to_networkx(g)
             for i,x in enumerate(embs[self.level]):
                 h = hash_table.index(x.detach().numpy())[0]
                 # def total_sigma(self, level, node, tree, sigmas, ee):
@@ -128,10 +142,11 @@ class HashDecoder(Decoder):
             if idx in skipped_idx:
                 continue
             motif_inds = torch.tensor([hash_idx[h] for h in all_hashes[idx]])
-            g_pair['pos'].motif_pred = motif_inds
-            g_pair['pos'].cum_scores = all_scores[idx]
-            g_pair['pos'].spotlight_ids = all_spotlights[idx]
-            decoded_graphs.append(g_pair['pos'])
+            g = g_pair['pos'] if isinstance(g_pair, dict) else g_pair
+            g.motif_pred = motif_inds
+            g.cum_scores = all_scores[idx]
+            g.spotlight_ids = all_spotlights[idx]
+            decoded_graphs.append(g)
 
         return decoded_graphs
 
@@ -159,7 +174,7 @@ class HashDecoder(Decoder):
         return motifs_pred_all, true_motif_ids, sigma_all
 
     def motif_sigma(self, decoded_graphs):
-        _, true_motif_ids, sigma_all = HashDecoder.collect_output(decoded_graphs)
+        _, true_motif_ids, sigma_all = DiscHashDecoder.collect_output(decoded_graphs)
         sig_mot = torch.tensor([0., 0.]).scatter_add(0, true_motif_ids, sigma_all)
         vals, counts = torch.unique(true_motif_ids, return_counts=True)
         return sig_mot / counts
@@ -178,7 +193,7 @@ class HashDecoder(Decoder):
         """
 
         # collect all the graphs into one big tensor
-        motifs_pred_all, true_motif_ids, sigma_all = HashDecoder.collect_output(decoded_graphs)
+        motifs_pred_all, true_motif_ids, sigma_all = DiscHashDecoder.collect_output(decoded_graphs)
 
         # compute average sigma by motif ID
         motif_ids,counts = torch.unique(motifs_pred_all, return_counts=True)
@@ -236,7 +251,7 @@ if __name__ == "__main__":
     # g = Data(cum_scores=scores, motif_pred=pred, motif_id=true)
     # _eval([g], top_k=2)
 
-    decoder = HashDecoder('barbell-borg-15',
+    decoder = DiscHashDecoder('barbell-borg-15',
                           'synth-distort-barbell-d0.00',
                           dummy=False,
                           level=2)

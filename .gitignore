@@ -171,3 +171,6 @@ MotiFiesta/utils/__pycache__/learning_utils.cpython-39.pyc
 MotiFiesta/utils/__pycache__/real_world.cpython-39.pyc
 MotiFiesta/utils/__pycache__/subgraph_similarity.cpython-39.pyc
 MotiFiesta/utils/__pycache__/synthetic.cpython-39.pyc
+data/mips_torch/processed/pre_filter.pt
+data/mips_torch/processed/pre_transform.pt
+data/mips_torch/processed/system_graph.pt

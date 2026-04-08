@@ -1,15 +1,18 @@
 #!/urs/bin/env/ python
 
 from MotiFiesta.training.decode import HashDecoder
+from MotiFiesta.training.disc_decode import DiscHashDecoder
 
-model_id = 'barbell-d0.00'
-data_id = 'synth-distort-barbell-d0.00'
+#model_id = 'barbell-d0.00'
+#data_id = 'synth-distort-barbell-d0.00'
+model_id = 'test'
+data_id = 'data/mips_torch'
 level = 3
 
-decoder = HashDecoder(model_id, data_id, level)
+#decoder = HashDecoder(model_id, data_id, level)
+decoder = DiscHashDecoder(model_id, data_id, level)
 
 decoded_graphs = decoder.decode()
 
 for graph in decoded_graphs:
 	print(f"Motif assignment for each node: {graph.motif_pred}")
-

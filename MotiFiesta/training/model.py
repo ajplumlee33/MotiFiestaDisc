@@ -5,6 +5,7 @@ import time
 
 from tqdm import tqdm
 import torch
+import torch.nn.functional as F
 from torch.nn import Linear
 from torch_geometric.nn import global_add_pool
 from torch.nn.functional import normalize
@@ -93,7 +94,7 @@ class MotiFiestaModel(torch.nn.Module):
 
         return torch.nn.ModuleList(layers)
 
-    def forward(self, x, edge_index, batch, dummy=False, x_null=None, e_null=None):
+    def forward(self, x, edge_index, batch, n_id=None, dummy=False, x_null=None, e_null=None):
         """One forward pass applies the model over all steps (all the way up).
         This function computes embeddings and probabilities and constructs two
         data structures which store the history of pooling operations.
@@ -114,14 +115,15 @@ class MotiFiestaModel(torch.nn.Module):
 
         :return: node embeddings, contraction probabilities, edgelists, merge info
         """
-        merge_tree = {}
-        spotlights = {}
-        nodes = list(range(len(x)))
-        merge_tree[0] = {n:set({}) for n in nodes}
-        spotlights[0] = {n:{n} for n in nodes}
 
-        edge_index_initial = edge_index
-        nodes_initial = nodes
+        """ n_id: global node mapping from neighborloader """
+        if n_id is None:
+            # fallback for non-sampled graphs
+            n_id = torch.arange(x.size(0), device=x.device)
+
+        # initialize spotlights with global protein IDs
+        spotlights = {0: init_global_spotlights(n_id)}
+        merge_tree = {0: {i: set() for i in range(len(x))}}
 
         # keep track of embeddings, edge scores, edge_index at each step
         xx, ee, pp = [], [], []
@@ -153,11 +155,12 @@ class MotiFiestaModel(torch.nn.Module):
         merge_info = {'tree': merge_tree, 'spotlights': spotlights}
 
         return xx, pp, ee, batches, merge_info, internals
-
+    
     def rec_loss(self,
                  xx,
                  ee,
                  spotlights,
+                 master_data,
                  graphs,
                  batch,
                  node_feats,
@@ -173,42 +176,37 @@ class MotiFiestaModel(torch.nn.Module):
         """
         loss = 0
         for level in range(len(xx)):
-            # do this for all incident nodes
             x = internals[level]['x_merged']
 
-            extract_start = time.time()
-            subgraphs, node_features = get_edge_subgraphs(ee[level],
-                                                          spotlights,
-                                                          level,
-                                                          graphs,
-                                                          node_feats,
-                                                          batch,
-                                                          )
+            # 1. Use the global extractor
+            subgraphs, node_features = get_global_subgraphs(
+                ee[level],
+                spotlights,
+                level,
+                master_data.nx_graph,
+                master_data.cached_data.x
+            )
 
-            # embedding are normalized so taking distance is equivalent to cosine
             K_predict = matrix_cosine(x[:num_nodes], x[:num_nodes])
             K_predict = K_predict.to(get_device())
 
-            wwl_start = time.time()
-            K_true = build_wwl_K(subgraphs[:num_nodes], node_features[:num_nodes])
-            # K_true = build_wwl_K(subgraphs[:num_nodes])
-            # K_true = build_wwl_K(subgraphs, node_features)
+            # 2. THE FIX: Standard Python list of float64 arrays 
+            # This allows the cgoliver/WWL fork to process each motif's features individually
+            formatted_features = [
+                (f.cpu().numpy() if torch.is_tensor(f) else f).astype(np.float64) 
+                for f in node_features[:num_nodes]
+            ]
 
+            # 3. Pass the subgraphs (which must be igraph objects) and the list
+            K_true = build_wwl_K(subgraphs[:num_nodes], formatted_features)
             K_true = K_true.to(get_device())
 
-            # if random.random() < .001:
-                # plot_K(K_true, K_predict)
             if draw:
                 for i in range(num_nodes):
                     for j in range(num_nodes):
-                        g1, g2 = subgraphs[i], subgraphs[j]
-                        fig, ax = plt.subplots(1, 2)
-                        nx.draw(g1, ax=ax[0])
-                        nx.draw(g2, ax=ax[1])
-                        print('g1', x[i])
-                        print('g2', x[j])
-                        fig.suptitle(f"true: {K_true[i][j]}, pred: {K_predict[i][j]}")
-                        plt.show()
+                        # Note: If subgraphs are igraph, nx.draw will fail here.
+                        # You would need nx.draw(subgraphs[i].to_networkx())
+                        pass 
 
             l = torch.nn.MSELoss()(K_predict, K_true)
             loss += l
@@ -322,6 +320,29 @@ class MotiFiestaModel(torch.nn.Module):
 
         tot_loss /= steps
         return tot_loss
+    
+    def zsc_loss(self, pos_scores, neg_scores, stats):
+        """
+        calculates the statistical significance of motif frequencies.
+        uses running statistics from the null model batches
+        """
+        # extract mean and std from the tracker
+        mu = torch.tensor(stats.mean(), device=pos_scores.device, dtype=torch.float32)
+        sigma = stats.std()
+
+        # compute the z-score for the positive (real) batch
+        # high z-score means the motif is significantly over-represented
+        z_scores = (pos_scores - mu) / (sigma + 1e-8)
+
+        # loss is the negative mean z-score 
+        # minimizing this forces the gnn to find highly significant motifs
+        loss = -z_scores.mean()
+
+        # add a small penalty if the gnn makes the null model too predictable
+        # this prevents the model from "cheating" by collapsing the null space
+        regularization = F.mse_loss(neg_scores, mu.expand_as(neg_scores))
+        
+        return loss + 0.1 * regularization
 
 def matrix_cosine(a, b, eps=1e-8):
     """
