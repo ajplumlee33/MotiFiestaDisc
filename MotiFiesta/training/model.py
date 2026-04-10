@@ -178,7 +178,7 @@ class MotiFiestaModel(torch.nn.Module):
         for level in range(len(xx)):
             x = internals[level]['x_merged']
 
-            # 1. Use the global extractor
+            # use the global extractor
             subgraphs, node_features = get_global_subgraphs(
                 ee[level],
                 spotlights,
@@ -190,23 +190,28 @@ class MotiFiestaModel(torch.nn.Module):
             K_predict = matrix_cosine(x[:num_nodes], x[:num_nodes])
             K_predict = K_predict.to(get_device())
 
-            # 2. THE FIX: Standard Python list of float64 arrays 
-            # This allows the cgoliver/WWL fork to process each motif's features individually
+            # standard python list of float64 arrays 
+            # allows the cgoliver/WWL fork to process each motif's features individually
             formatted_features = [
                 (f.cpu().numpy() if torch.is_tensor(f) else f).astype(np.float64) 
                 for f in node_features[:num_nodes]
             ]
 
-            # 3. Pass the subgraphs (which must be igraph objects) and the list
+            # pass the subgraphs (which must be igraph objects) and the list
             K_true = build_wwl_K(subgraphs[:num_nodes], formatted_features)
             K_true = K_true.to(get_device())
 
             if draw:
                 for i in range(num_nodes):
                     for j in range(num_nodes):
-                        # Note: If subgraphs are igraph, nx.draw will fail here.
-                        # You would need nx.draw(subgraphs[i].to_networkx())
-                        pass 
+                        g1, g2 = subgraphs[i], subgraphs[j]
+                        fig, ax = plt.subplots(1, 2)
+                        nx.draw(g1, ax=ax[0])
+                        nx.draw(g2, ax=ax[1])
+                        print('g1', x[i])
+                        print('g2', x[j])
+                        fig.suptitle(f"true: {K_true[i][j]}, pred: {K_predict[i][j]}")
+                        plt.show()
 
             l = torch.nn.MSELoss()(K_predict, K_true)
             loss += l
@@ -404,6 +409,7 @@ def plot_K(K_true, K_pred):
     sns.heatmap(K_pred.detach().numpy(), vmin=0, vmax=1, ax=ax[1])
     plt.show()
     pass
+
 if __name__ == "__main__":
     import doctest
     doctest.testmod()

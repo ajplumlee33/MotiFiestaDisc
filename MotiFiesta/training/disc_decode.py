@@ -43,41 +43,87 @@ class DiscHashDecoder(Decoder):
 
     @staticmethod
     def total_sigma(level, node, tree, sigmas, ee):
-        """ Recursively compute total sigma score
-        for a subgraph.
-        """
-        children = list(tree[level][node])
-        n_children = len(children)
-
-        if n_children == 0:
+        """ Recursively compute total sigma score for a subgraph. """
+        if level == 0:
             return 0
-        elif n_children == 1:
-            return DiscHashDecoder.total_sigma(level-1, children[0], tree, sigmas, ee)
-        else:
-            #eind = (ee[level-1][0] == children[0]) &\
-            #       (ee[level-1][1] == children[1])
-            #eind = eind.nonzero()[0][0].item()
 
-            # convert sets to lists, then to tensors
-            # bypasses the 'dtype of set' error
-            tree_0 = torch.as_tensor(list(tree[level-1][0]))
-            tree_1 = torch.as_tensor(list(tree[level-1][1]))
+        children = list(tree[level][node])
 
-            # proceed with the mask and nonzero check
-            eind_mask = (tree_0 == node) | (tree_1 == node)
-            valid_indices = eind_mask.nonzero()
+        if len(children) < 2:
+            return DiscHashDecoder.total_sigma(level - 1, children[0], tree, sigmas, ee)
 
-            if valid_indices.numel() == 0:
-                return 0 
+        c0, c1 = children[0], children[1]
+        
+        # use the dictionary lookup provided in the 'ee' argument
+        edge_lookups = ee
+        e_idx = edge_lookups[level-1].get(tuple(sorted((c0, c1))))
 
-            eind = valid_indices[0][0].item()
-            score = sigmas[level-1][eind]
-            # get score for this node
-            return score +\
-                   DiscHashDecoder.total_sigma(level-1, children[0], tree, sigmas, ee) +\
-                   DiscHashDecoder.total_sigma(level-1, children[1], tree, sigmas, ee)
+        if e_idx is None:
+            return DiscHashDecoder.total_sigma(level-1, c0, tree, sigmas, ee) +\
+                   DiscHashDecoder.total_sigma(level-1, c1, tree, sigmas, ee)
 
+        current_score = sigmas[level-1][e_idx]
 
+        return current_score +\
+               DiscHashDecoder.total_sigma(level-1, c0, tree, sigmas, ee) +\
+               DiscHashDecoder.total_sigma(level-1, c1, tree, sigmas, ee)
+    
+    def plot_motif_summary(self, decoded_graphs):
+        g_pyg = decoded_graphs[0]
+        G_full = to_networkx(g_pyg, to_undirected=True)
+        unique_motifs = torch.unique(g_pyg.motif_pred)
+        
+        # collect data first so we can sort it
+        summary_data = []
+        for m_id in unique_motifs:
+            if m_id == 0: continue 
+            mask = (g_pyg.motif_pred == m_id)
+            all_node_indices = mask.nonzero(as_tuple=True)[0].tolist()
+            avg_score = g_pyg.cum_scores[mask].mean().item()
+
+            subgraph_all = G_full.subgraph(all_node_indices)
+            num_instances = nx.number_connected_components(subgraph_all)
+            avg_nodes = len(all_node_indices) / num_instances if num_instances > 0 else 0
+            
+            summary_data.append({
+                'id': m_id.item(),
+                'total': len(all_node_indices),
+                'avg_nodes': avg_nodes,
+                'score': avg_score,
+                'nodes': all_node_indices
+            })
+
+        # sort by score (Significance/Kleos) in descending order
+        summary_data.sort(key=lambda x: x['score'], reverse=True)
+
+        print(f"\n{'ID':<5} | {'Total Nodes':<12} | {'Avg Nodes':<12} | {'Score'}")
+        print("-" * 55)
+
+        for data in summary_data:
+            print(f"{data['id']:<5} | {data['total']:<12} | {data['avg_nodes']:<12.2f} | {data['score']:.4f}")
+            
+            # draw the representative example for the sorted motifs
+            rep_node = data['nodes'][0]
+            example_nodes = [n for n in G_full.neighbors(rep_node) if g_pyg.motif_pred[n] == data['id']]
+            example_nodes.append(rep_node)
+            self._draw_single_example(G_full, example_nodes, data['id'])
+
+    def _draw_single_example(self, G_full, nodes, motif_id):
+        subgraph = G_full.subgraph(nodes)
+        plt.figure(figsize=(4, 4))
+        
+        pos = nx.spring_layout(subgraph, seed=42) 
+        
+        nx.draw(subgraph, pos, 
+                with_labels=True, 
+                node_color='#A0CBE2', 
+                edge_color='#BBBBBB',
+                node_size=600,
+                font_size=10)
+        
+        plt.title(f"Representative Plot: Motif {motif_id}\n({len(nodes)} nodes)")
+        plt.show()
+    
     def decode(self, n_graphs=-1):
         # one hash table for each coarsening level
         hash_table = LSHash(self.hash_dim, self.model.hidden_dim)
@@ -117,12 +163,18 @@ class DiscHashDecoder(Decoder):
                 all_hashes.append(None)
                 all_spotlights.append(None)
                 continue
+
+            # convert edge lists to lookup dictionaries before recursion
+            ee_lookups = []
+            for layer_ee in ee:
+                lookup = {tuple(sorted((e[0], e[1]))): i for i, e in enumerate(layer_ee.t().tolist())}
+                ee_lookups.append(lookup)
             g = to_networkx(g)
             for i,x in enumerate(embs[self.level]):
                 h = hash_table.index(x.detach().numpy())[0]
                 # def total_sigma(self, level, node, tree, sigmas, ee):
                 spotlight = list(merge_info['spotlights'][self.level][i])
-                score = self.total_sigma(self.level, i, merge_info['tree'], probas, ee)
+                score = self.total_sigma(self.level, i, merge_info['tree'], probas, ee_lookups)
                 hash_set.add(h)
                 for node in spotlight:
                     motif_scores[node] = score
@@ -252,9 +304,9 @@ if __name__ == "__main__":
     # _eval([g], top_k=2)
 
     decoder = DiscHashDecoder('barbell-borg-15',
-                          'synth-distort-barbell-d0.00',
-                          dummy=False,
-                          level=2)
+                              'synth-distort-barbell-d0.00',
+                              dummy=False,
+                              level=2)
     graphs = decoder.decode(n_graphs=5)
     score = decoder.eval(graphs, top_k=5)
     mot_sigma = decoder.motif_sigma(graphs)
