@@ -12,7 +12,9 @@ level = 3
 #decoder = HashDecoder(model_id, data_id, level)
 decoder = DiscHashDecoder(model_id, data_id, level)
 
-decoded_graphs = decoder.decode()
+decoded_graphs = decoder.decode(n_graphs=1)
 
-for graph in decoded_graphs:
-	print(f"Motif assignment for each node: {graph.motif_pred}")
+stats = decoder.plot_motif_summary(decoded_graphs)
+
+#for graph in decoded_graphs:
+	#print(f"Motif assignment for each node: {graph.motif_pred}")
