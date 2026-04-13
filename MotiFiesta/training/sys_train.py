@@ -1,5 +1,5 @@
 import torch
-import torch.nn.functional as F
+import torch.nn.functional as f
 from torch.utils.tensorboard import SummaryWriter
 from torch.nn.utils import clip_grad_norm_
 from tqdm import tqdm
@@ -15,9 +15,16 @@ class Controller:
     """
     tracks training progress and decides when to switch phases
     """
-    def __init__(self, since_best_threshold=30):
+    def __init__(self, since_best_threshold=30, mode='freq'):
         self.since_best_threshold = since_best_threshold
-        self.modules = ['rec', 'zsc']
+        # rec is always active; mode determines others
+        if mode == 'freq':
+            self.modules = ['rec', 'mot']
+        elif mode == 'zscore':
+            self.modules = ['rec', 'zsc']
+        else: # combined
+            self.modules = ['rec', 'mot', 'zsc']
+            
         self.best_losses = {key: {'best': float('inf'), 'since_best': 0}
                             for key in self.modules}
 
@@ -26,6 +33,8 @@ class Controller:
 
     def update(self, losses):
         for key, val in losses.items():
+            if key not in self.best_losses:
+                continue
             if val < self.best_losses[key]['best']:
                 self.best_losses[key]['best'] = val
                 self.best_losses[key]['since_best'] = 0
@@ -48,6 +57,7 @@ def sys_train(model,
                 train_loader,
                 test_loader,
                 master_data,
+                mode='combined',
                 model_name='default',
                 estimator='kde',
                 epochs=5,
@@ -69,10 +79,10 @@ def sys_train(model,
     os.makedirs(f'models/{model_name}', exist_ok=True)
 
     if controller_state is None:
-        controller = Controller(since_best_threshold=stop_epochs)
+        controller_obj = Controller(since_best_threshold=stop_epochs, mode=mode)
     else:
-        controller = Controller()
-        controller.set_state(controller_state)
+        controller_obj = Controller()
+        controller_obj.set_state(controller_state)
 
     if optimizer is None:
         optimizer = torch.optim.Adam(model.parameters())
@@ -86,7 +96,7 @@ def sys_train(model,
 
         model.train()
         model.to(device)
-        train_losses = {'rec': 0.0, 'zsc': 0.0}
+        train_losses = {'rec': 0.0, 'zsc': 0.0, 'mot': 0.0}
         
         num_train_batches = len(train_loader)
         n_train = max_batches if max_batches > 0 else num_train_batches
@@ -98,56 +108,50 @@ def sys_train(model,
             pos = batch_dict['pos'].to(device)
             neg = batch_dict['neg'].to(device)
 
-            global_pos_ids = pos.n_id if hasattr(pos, 'n_id') else torch.arange(pos.x.size(0), device=device)
-            global_neg_ids = neg.n_id if hasattr(neg, 'n_id') else torch.arange(neg.x.size(0), device=device)
+            g_pos_ids = pos.n_id if hasattr(pos, 'n_id') else torch.arange(pos.x.size(0), device=device)
+            g_neg_ids = neg.n_id if hasattr(neg, 'n_id') else torch.arange(neg.x.size(0), device=device)
 
             optimizer.zero_grad()
             
-            batch_pos_vec = pos.batch if pos.batch is not None else torch.zeros(pos.x.size(0), dtype=torch.long, device=device)
-            batch_neg_vec = neg.batch if neg.batch is not None else torch.zeros(neg.x.size(0), dtype=torch.long, device=device)
+            b_pos_vec = pos.batch if pos.batch is not None else torch.zeros(pos.x.size(0), dtype=torch.long, device=device)
+            b_neg_vec = neg.batch if neg.batch is not None else torch.zeros(neg.x.size(0), dtype=torch.long, device=device)
 
-            xx_pos, pp_pos, ee_pos, bb_pos, m_info_pos, int_pos = model(pos.x, pos.edge_index, batch_pos_vec, n_id=global_pos_ids)
-            xx_neg, pp_neg, ee_neg, bb_neg, m_info_neg, int_neg = model(neg.x, neg.edge_index, batch_neg_vec, n_id=global_neg_ids)
+            xx_pos, pp_pos, ee_pos, bb_pos, m_info_pos, int_pos = model(pos.x, pos.edge_index, b_pos_vec, n_id=g_pos_ids)
+            xx_neg, pp_neg, ee_neg, bb_neg, m_info_neg, int_neg = model(neg.x, neg.edge_index, b_neg_vec, n_id=g_neg_ids)
 
             loss = torch.tensor(0.0, device=device)
             backward = False
-            
-            # check phase transition
-            warmup_done = not controller.keep_going('rec')
+            warmup_done = not controller_obj.keep_going('rec')
 
             # reconstruction (jointly active as anchor)
-            if controller.keep_going('rec') or warmup_done:
+            if controller_obj.keep_going('rec') or warmup_done:
                 pos.num_graphs = 1
-                graphs_pos = to_graphs(pos) 
-                
-                rec_loss = model.rec_loss(
-                    xx=xx_pos,
-                    ee=ee_pos,
-                    spotlights=m_info_pos['spotlights'],
-                    master_data=master_data,
-                    graphs=graphs_pos,
-                    batch=batch_pos_vec,
-                    node_feats=pos.x,
-                    internals=int_pos
-                )
-                
-                # weight reduction during significance phase to prevent drift
+                rec_loss = model.rec_loss(xx_pos, ee_pos, m_info_pos['spotlights'], master_data, to_graphs(pos), b_pos_vec, pos.x, int_pos)
                 rec_weight = 1.0 if not warmup_done else 0.2
                 loss = loss + (rec_loss * rec_weight)
                 train_losses['rec'] += rec_loss.item()
                 backward = True
 
-            # significance (active after warmup)
-            if warmup_done and controller.keep_going('zsc'):
-                pos_scores = pp_pos[0]
-                neg_scores = pp_neg[0]
-                
-                stats.push(neg_scores.detach().mean())
-                zsc_loss = model.zsc_loss(pos_scores, neg_scores, stats)
-                
-                loss = loss + (zsc_loss * lam)
-                train_losses['zsc'] += zsc_loss.item()
-                backward = True
+            # motif significance/frequency logic
+            if warmup_done:
+                # frequency loss
+                if mode in ['freq', 'combined'] and controller_obj.keep_going('mot'):
+                    mot_loss = model.freq_loss(int_pos, int_neg, pp_pos, steps=model.steps, 
+                                               estimator=estimator, volume=volume, k=n_neighbors, 
+                                               lam=lam, beta=beta)
+                    loss = loss + mot_loss
+                    train_losses['mot'] += mot_loss.item()
+                    backward = True
+
+                # z-score loss
+                if mode in ['zscore', 'combined'] and controller_obj.keep_going('zsc'):
+                    pos_sc = torch.stack([p.mean() for p in pp_pos]).mean()
+                    neg_sc = torch.stack([p.mean() for p in pp_neg]).mean()
+                    stats.push(neg_sc.detach())
+                    zsc_loss = model.zsc_loss(pos_sc, neg_sc, stats)
+                    loss = loss + (zsc_loss * lam)
+                    train_losses['zsc'] += zsc_loss.item()
+                    backward = True
 
             if backward:
                 loss.backward()
@@ -159,71 +163,47 @@ def sys_train(model,
 
         # validation phase
         model.eval()
-        test_losses = {'rec': 0.0, 'zsc': 0.0}
+        test_losses = {'rec': 0.0, 'zsc': 0.0, 'mot': 0.0}
         n_test = max_batches if max_batches > 0 else len(test_loader)
 
         with torch.no_grad():
             for batch_idx, batch_dict in tqdm(enumerate(test_loader), total=n_test, desc=f"epoch {epoch+1} [test]"):
                 if batch_idx >= n_test:
                     break
-
                 pos = batch_dict['pos'].to(device)
-                
-                # pos pass
                 g_pos_ids = pos.n_id if hasattr(pos, 'n_id') else torch.arange(pos.x.size(0), device=device)
                 b_pos_vec = pos.batch if pos.batch is not None else torch.zeros(pos.x.size(0), dtype=torch.long, device=device)
-                
                 xx_pos, pp_pos, ee_pos, bb_pos, m_info_pos, int_pos = model(pos.x, pos.edge_index, b_pos_vec, n_id=g_pos_ids)
                 
-                # rec loss
                 pos.num_graphs = 1
-                graphs_pos = to_graphs(pos)
-                rec_val = model.rec_loss(xx_pos, ee_pos, m_info_pos['spotlights'], master_data, graphs_pos, b_pos_vec, pos.x, int_pos)
+                rec_val = model.rec_loss(xx_pos, ee_pos, m_info_pos['spotlights'], master_data, to_graphs(pos), b_pos_vec, pos.x, int_pos)
                 test_losses['rec'] += rec_val.item()
 
-                # zsc loss
-                warmup_done = not controller.keep_going('rec')
+                warmup_done = not controller_obj.keep_going('rec')
                 if warmup_done:
                     neg = batch_dict['neg'].to(device)
-                    # use neg's own n_id to avoid key mismatches
                     g_neg_ids = neg.n_id if hasattr(neg, 'n_id') else torch.arange(neg.x.size(0), device=device)
                     b_neg_vec = neg.batch if neg.batch is not None else torch.zeros(neg.x.size(0), dtype=torch.long, device=device)
-                    
                     xx_neg, pp_neg, ee_neg, bb_neg, m_info_neg, int_neg = model(neg.x, neg.edge_index, b_neg_vec, n_id=g_neg_ids)
                     
-                    zsc_val = model.zsc_loss(pp_pos[0], pp_neg[0], stats)
-                    test_losses['zsc'] += zsc_val.item()
+                    if mode in ['freq', 'combined']:
+                        test_losses['mot'] += model.freq_loss(int_pos, int_neg, pp_pos, steps=model.steps, estimator=estimator, k=n_neighbors, lam=lam, beta=beta).item()
+                    if mode in ['zscore', 'combined']:
+                        test_losses['zsc'] += model.zsc_loss(torch.stack([p.mean() for p in pp_pos]).mean(), torch.stack([p.mean() for p in pp_neg]).mean(), stats).item()
 
         avg_train = {k: v / n_train for k, v in train_losses.items()}
         avg_test = {k: v / n_test for k, v in test_losses.items()}
-        
-        controller.update(avg_test)
+        controller_obj.update(avg_test)
 
-        current_phase = "joint (significance + rec)" if not controller.keep_going('rec') else "warmup (rec only)"
-
-        print(f"\n{'='*40}")
-        print(f"epoch: {epoch+1} | phase: {current_phase}")
-        print(f"train -> rec: {avg_train['rec']:.6f} | zsc: {avg_train['zsc']:.6f}")
-        print(f"test  -> rec: {avg_test['rec']:.6f} | zsc: {avg_test['zsc']:.6f}")
-        print(f"{'='*40}\n")
+        print(f"\nepoch: {epoch+1} | mode: {mode}")
+        print(f"train -> rec: {avg_train['rec']:.6f} | zsc: {avg_train['zsc']:.6f} | mot: {avg_train['mot']:.6f}")
+        print(f"test  -> rec: {avg_test['rec']:.6f} | zsc: {avg_test['zsc']:.6f} | mot: {avg_test['mot']:.6f}\n")
 
         model.cpu()
-        checkpoint = {
-            'epoch': epoch + 1,
-            'model_state_dict': model.state_dict(),
-            'optimizer_state_dict': optimizer.state_dict(),
-            'controller_state_dict': controller.state_dict(),
-            'stats_state_dict': stats.state_dict() if hasattr(stats, 'state_dict') else None
-        }
-        torch.save(checkpoint, f'models/{model_name}/{model_name}.pth')
+        torch.save({'epoch': epoch+1, 'model_state_dict': model.state_dict(), 'optimizer_state_dict': optimizer.state_dict(), 'controller_state_dict': controller_obj.state_dict()}, f'models/{model_name}/{model_name}.pth')
         model.to(device)
-        
-        writer.add_scalar("loss/train_rec", avg_train['rec'], epoch)
-        writer.add_scalar("loss/test_rec", avg_test['rec'], epoch)
-        writer.add_scalar("loss/train_zsc", avg_train['zsc'], epoch)
-        writer.add_scalar("loss/test_zsc", avg_test['zsc'], epoch)
+        for k in controller_obj.modules:
+            writer.add_scalar(f"loss/train_{k}", avg_train[k], epoch)
+            writer.add_scalar(f"loss/test_{k}", avg_test[k], epoch)
 
-    model.cpu()
-    torch.save(checkpoint, f'models/{model_name}/{model_name}.pth')
     writer.close()
-    print(f"training finished. final model saved to models/{model_name}/{model_name}.pth")

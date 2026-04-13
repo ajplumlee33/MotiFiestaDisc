@@ -36,6 +36,7 @@ if function == 'train':
     parser.add_argument("--data_root", type=str, default='.')
     parser.add_argument("--restart", "-r", action='store_true', default=False,  help='Restart model.')
     parser.add_argument("--disc", "-di", action='store_true', default=False,  help='Discovery mode.')
+    parser.add_argument("--mode", "-md", default='combined',  help='Loss mode.')
 
     # training  loop
     parser.add_argument("--batch-size", "-b", type=int, default=16)
@@ -137,6 +138,7 @@ if function == 'train':
                     train_loader=data['loader_train'],
                     test_loader=data['loader_test'],
                     master_data=data['dataset_whole'],
+                    mode=args.mode,
                     model_name=args.name,
                     epochs=args.epochs,
                     max_batches=args.max_batches,
