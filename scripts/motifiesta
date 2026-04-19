@@ -51,6 +51,10 @@ if function == 'train':
     parser.add_argument("--estimator", "-es", type=str, default='knn', help="Which density estimator to use for the motif agg. step")
     parser.add_argument("--n-neighbors", "-nn", type=int, default=30, help="Number of neighbors")
     parser.add_argument("--volume", "-vv", action='store_true', default=False, help="Use d-sphere volume to normalize density with kNN.")
+    parser.add_argument("--zsc-method", type=str, default='ema', choices=['ema', 'local'],
+                        help="z-score loss method: 'ema' uses streaming null stats, 'local' uses k nulls per positive sample")
+    parser.add_argument("--zsc-k", type=int, default=10,
+                        help="number of null realisations per positive sample (only used when --zsc-method local)")
 
     # model architecture
     parser.add_argument("--steps", "-s", type=int, default=5)
@@ -85,6 +89,8 @@ if function == 'train':
                         'k': args.n_neighbors,
                         'volume': args.volume,
                         'attributed': args.attributed,
+                        'zsc_method': args.zsc_method,
+                        'zsc_k': args.zsc_k,
                         }
                 }
 
@@ -93,7 +99,7 @@ if function == 'train':
                       name=args.dataset,
                       root=args.data_root,
                       batch_size=hparams['train']['batch_size'],
-                      attributed=hparams['train']['attributed']
+                      attributed=hparams['train']['attributed'],
                       )
 
     hparams['model']['n_features'] = data['dataset_whole'].num_features
@@ -137,8 +143,10 @@ if function == 'train':
         sys_train(model,
                     train_loader=data['loader_train'],
                     test_loader=data['loader_test'],
-                    master_data=data['dataset_whole'],
+                    source_graph=data['dataset_whole'],
                     mode=args.mode,
+                    zsc_method=args.zsc_method,
+                    zsc_k=args.zsc_k,
                     model_name=args.name,
                     epochs=args.epochs,
                     max_batches=args.max_batches,

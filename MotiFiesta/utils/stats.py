@@ -3,7 +3,7 @@ import torch
 class RunningStats:
     def __init__(self, momentum=0.9):
         self.momentum = momentum
-        self.n = 0
+        self.count = 0
         self.running_mean = 0
         self.running_var = 1
 
@@ -15,7 +15,7 @@ class RunningStats:
         # ensure x is a float for calculation
         val = x.item() if torch.is_tensor(x) else x
         
-        if self.n == 0:
+        if self.count == 0:
             self.running_mean = val
             self.running_var = 1.0 # Initial guess
         else:
@@ -25,7 +25,7 @@ class RunningStats:
             diff_sq = (val - self.running_mean) ** 2
             self.running_var = (self.momentum * self.running_var) + (1 - self.momentum) * diff_sq
         
-        self.n += 1
+        self.count += 1
 
     def mean(self):
         return self.running_mean
