@@ -179,7 +179,7 @@ class MotiFiestaModel(torch.nn.Module):
         Here we supervise the embedding for pairs of nodes.
         """
         # pull the full graph and its features once per call
-        source_nx = source_graph.nx_graph
+        source_ig = source_graph.ig_graph
         source_x = source_graph.cached_data.x
 
         loss = 0
@@ -191,7 +191,7 @@ class MotiFiestaModel(torch.nn.Module):
             subgraphs, node_features = get_edge_subgraphs(ee[level],
                                                           spotlights,
                                                           level,
-                                                          source_nx,
+                                                          source_ig,
                                                           source_x,
                                                           None,
                                                           )
