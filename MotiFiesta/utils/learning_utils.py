@@ -44,7 +44,7 @@ def load_model(run, permissive=False, verbose=True):
     return {'model': model,
             'epoch': model_dict['epoch'],
             'optimizer':optimizer,
-            # 'controller_state_dict': model_dict['controller_state_dict']
+            'controller_state_dict': model_dict['controller_state_dict']
             }
 
 def dump_model_hparams(name, hparams):

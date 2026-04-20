@@ -1,17 +1,32 @@
 import torch
 import pandas as pd
-import numpy as np
 import os.path as osp
+
+import torch_geometric.transforms as T
 from torch_geometric.data import Data, Dataset
 from torch_geometric.utils import to_undirected
 from torch_geometric.utils import to_networkx
+from torch_geometric.utils import degree
+
 
 class SysTxtDataset(Dataset):
-    def __init__(self, root, transform=None, pre_transform=None):
+    def __init__(self, root, max_degree=None, n_features=None, transform=None, pre_transform=None):
+        """ Builds a single-graph dataset from a plain edge list file.
+
+        Args:
+        ---
+        root (str): path to folder containing the raw edge list
+        max_degree (int): cap for one-hot degree encoding. if None, uses the
+            graph's actual max degree at process time.
+        n_features (int): optional override for num_features
+        """
+        self.max_degree = max_degree
+        self.n_features = n_features
         super().__init__(root, transform, pre_transform)
+
         # load into memory once
         self.cached_data = torch.load(self.processed_paths[0], weights_only=False)
-        # store master graph as an attribute so the model can query it for "truth"
+        # store source graph as an attribute so the model can query it for "truth"
         self.nx_graph = to_networkx(self.cached_data, to_undirected=True)
 
     @property
@@ -22,47 +37,39 @@ class SysTxtDataset(Dataset):
     def processed_file_names(self):
         return ['system_graph.pt']
 
+    @property
+    def num_features(self):
+        if self.n_features is not None:
+            return self.n_features
+        return self.cached_data.num_features
+
     def process(self):
-        # load raw mips ppi data
+        # load raw edge list
         # handles tabs or spaces automatically
         df = pd.read_csv(self.raw_paths[0], sep=None, engine='python', comment='#', header=None)
-        
+
         # establish universal node list
         # must include both columns to ensure 0-indexed continuity
         nodes = pd.concat([df[0], df[1]]).astype(str).unique()
         node_map = {n: i for i, n in enumerate(nodes)}
         num_nodes = len(nodes)
-        
+
         # map edges to these indices
         src = df[0].astype(str).map(node_map).values
         dst = df[1].astype(str).map(node_map).values
-        edge_index = torch.tensor(np.array([src, dst]), dtype=torch.long)
-        
-        # enforce undirected connectivity for ppi consistency
+        edge_index = torch.tensor([src, dst], dtype=torch.long)
+
+        # enforce undirected connectivity
         edge_index = to_undirected(edge_index)
 
-        # feature engineering (rigid 25-dim structure)
-        # using float32 to prevent numpy 'object' type conversion errors
-        x = torch.zeros((num_nodes, 25), dtype=torch.float32)
-        
-        # build a complete metadata map (column 2 = cat, column 4 = size)
-        m1 = df[[0, 2, 4]].rename(columns={0: 'prot', 2: 'cat', 4: 'size'})
-        m2 = df[[1, 2, 4]].rename(columns={1: 'prot', 2: 'cat', 4: 'size'})
-        meta_master = pd.concat([m1, m2]).drop_duplicates(subset=['prot']).set_index('prot')
+        # determine the one-hot degree cap if not provided
+        deg = degree(edge_index[0], num_nodes=num_nodes, dtype=torch.long)
+        max_deg = self.max_degree if self.max_degree is not None else int(deg.max().item())
 
-        # map using reindex to guarantee alignment with node_map
-        sizes = meta_master['size'].reindex(nodes).fillna(0).values
-        cats = meta_master['cat'].astype(str).apply(hash).reindex(nodes).fillna(0).values
+        # build data object and apply one-hot degree encoding
+        data = Data(edge_index=edge_index, num_nodes=num_nodes)
+        data = T.OneHotDegree(max_deg)(data)
 
-        x[:, 0] = torch.from_numpy(sizes).float() / 100.0
-        x[:, 1] = torch.from_numpy(cats % 10).float()
-        
-        # add some noise for remaining 23 dimensions
-        # this ensures the matrix is dense and prevents singular kernels
-        x[:, 2:] = torch.randn((num_nodes, 23)) * 0.01
-
-        # create and save
-        data = Data(x=x, edge_index=edge_index)
         torch.save(data, self.processed_paths[0])
 
     def len(self):

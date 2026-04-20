@@ -112,18 +112,25 @@ class MotiFiestaModel(torch.nn.Module):
         :param x: node features
         :param edge_index: list of edges
         :param batch: batching tensor
+        :param n_id: optional global node ids from neighborloader. when provided,
+            spotlights are initialised with these global ids so that subgraph lookups
+            can be performed on the full graph instead of the sampled neighbourhood.
 
         :return: node embeddings, contraction probabilities, edgelists, merge info
         """
-
-        """ n_id: global node mapping from neighborloader """
+        # fall back to local indices when no global mapping is given
         if n_id is None:
-            # fallback for non-sampled graphs
-            n_id = torch.arange(x.size(0), device=x.device)
+            n_id = torch.arange(len(x), device=x.device)
 
-        # initialize spotlights with global protein IDs
-        spotlights = {0: init_global_spotlights(n_id)}
-        merge_tree = {0: {i: set() for i in range(len(x))}}
+        merge_tree = {}
+        spotlights = {}
+        nodes = list(range(len(x)))
+        merge_tree[0] = {n: set({}) for n in nodes}
+        # level 0 spotlights hold the global id for each local node
+        spotlights[0] = {n: {n_id[n].item()} for n in nodes}
+
+        edge_index_initial = edge_index
+        nodes_initial = nodes
 
         # keep track of embeddings, edge scores, edge_index at each step
         xx, ee, pp = [], [], []
@@ -155,15 +162,12 @@ class MotiFiestaModel(torch.nn.Module):
         merge_info = {'tree': merge_tree, 'spotlights': spotlights}
 
         return xx, pp, ee, batches, merge_info, internals
-    
+
     def rec_loss(self,
                  xx,
                  ee,
                  spotlights,
-                 master_data,
-                 graphs,
-                 batch,
-                 node_feats,
+                 source_graph,
                  internals,
                  num_nodes=20,
                  draw=False):
@@ -174,33 +178,39 @@ class MotiFiestaModel(torch.nn.Module):
         where g_1 is the spotlight of node 1
         Here we supervise the embedding for pairs of nodes.
         """
+        # pull the full graph and its features once per call
+        source_nx = source_graph.nx_graph
+        source_x = source_graph.cached_data.x
+
         loss = 0
         for level in range(len(xx)):
+            # do this for all incident nodes
             x = internals[level]['x_merged']
 
-            # use the global extractor
-            subgraphs, node_features = get_global_subgraphs(
-                ee[level],
-                spotlights,
-                level,
-                master_data.nx_graph,
-                master_data.cached_data.x
-            )
+            # extract spotlight subgraphs from the full graph using global ids
+            subgraphs, node_features = get_edge_subgraphs(ee[level],
+                                                          spotlights,
+                                                          level,
+                                                          source_nx,
+                                                          source_x,
+                                                          None,
+                                                          )
 
+            # embedding are normalized so taking distance is equivalent to cosine
             K_predict = matrix_cosine(x[:num_nodes], x[:num_nodes])
             K_predict = K_predict.to(get_device())
 
-            # standard python list of float64 arrays 
-            # allows the cgoliver/WWL fork to process each motif's features individually
+            # wwl expects a list of per-graph float64 feature arrays
             formatted_features = [
-                (f.cpu().numpy() if torch.is_tensor(f) else f).astype(np.float64) 
+                (f.cpu().numpy() if torch.is_tensor(f) else f).astype(np.float64)
                 for f in node_features[:num_nodes]
             ]
 
-            # pass the subgraphs (which must be igraph objects) and the list
             K_true = build_wwl_K(subgraphs[:num_nodes], formatted_features)
             K_true = K_true.to(get_device())
 
+            # if random.random() < .001:
+                # plot_K(K_true, K_predict)
             if draw:
                 for i in range(num_nodes):
                     for j in range(num_nodes):
@@ -297,14 +307,25 @@ class MotiFiestaModel(torch.nn.Module):
             x_neg = internals_neg[t]['x_merged']
             s = pp[t]
 
+            # cap k to the number of available reference points at this level
+            # deeper contraction levels can have fewer edges than the configured k
+            k_eff = min(k, x_pos.size(0), x_neg.size(0))
+            if k_eff < 2:
+                continue
+
             if estimator == 'kde':
                 density_pos = self.kde(x_pos, x_pos)
                 density_neg = self.kde(x_pos, x_neg)
             if estimator == 'knn':
                 # density_pos = self.knn_density(x_pos, x_pos, k=k, volume=volume)
                 # density_neg = self.knn_density(x_pos, x_neg, k=k, volume=volume)
-                density_pos = self.distance_density(x_pos, x_pos, k=k)
-                density_neg = self.distance_density(x_pos, x_neg, k=k)
+                density_pos = self.distance_density(x_pos, x_pos, k=k_eff)
+                density_neg = self.distance_density(x_pos, x_neg, k=k_eff)
+
+                # normalize to [0, 1] as the f_pos/f_neg comment below assumes
+                scale = torch.cat([density_pos, density_neg]).max() + 1e-8
+                density_pos = density_pos / scale
+                density_neg = density_neg / scale
             if estimator == 'min':
                 density_pos = self.min_density(x_pos, x_pos)
                 density_neg = self.min_density(x_pos, x_neg)
@@ -325,29 +346,46 @@ class MotiFiestaModel(torch.nn.Module):
 
         tot_loss /= steps
         return tot_loss
-    
-    def zsc_loss(self, pos_scores, neg_scores, stats):
+
+    def zsc_loss_ema(self, pos_scores, neg_scores, stats):
         """
-        calculates the statistical significance of motif frequencies.
-        uses running statistics from the null model batches
+        z-score loss using running ema of a global null distribution.
+        compares pos scores against the streaming mean/std of neg scores
+        accumulated across all batches seen so far.
         """
         # extract mean and std from the tracker
         mu = torch.tensor(stats.mean(), device=pos_scores.device, dtype=torch.float32)
         sigma = stats.std()
 
-        # compute the z-score for the positive (real) batch
         # high z-score means the motif is significantly over-represented
         z_scores = (pos_scores - mu) / (sigma + 1e-8)
 
-        # loss is the negative mean z-score 
-        # minimizing this forces the gnn to find highly significant motifs
+        # minimising this forces the gnn to find highly significant motifs
         loss = -z_scores.mean()
 
-        # add a small penalty if the gnn makes the null model too predictable
-        # this prevents the model from "cheating" by collapsing the null space
+        # penalty when the null scores drift from their running mean
+        # prevents the model from collapsing the null distribution
         regularization = F.mse_loss(neg_scores, mu.expand_as(neg_scores))
-        
+
         return loss + 0.1 * regularization
+
+    def zsc_loss_local(self, pos_scores, null_scores):
+        """
+        z-score loss using a local null distribution.
+        null_scores is a tensor of k null realisations of the same pos batch.
+        mu and sigma are computed from those k samples, giving a per-batch
+        z-score that matches the classical network motif definition.
+        """
+        mu = null_scores.mean()
+        sigma = null_scores.std(unbiased=False)
+
+        # high z-score means the motif is significantly over-represented
+        z_scores = (pos_scores - mu) / (sigma + 1e-8)
+
+        # minimising this forces the gnn to find highly significant motifs
+        loss = -z_scores.mean()
+
+        return loss
 
 def matrix_cosine(a, b, eps=1e-8):
     """

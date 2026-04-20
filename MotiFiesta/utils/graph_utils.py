@@ -100,7 +100,14 @@ def to_graphs(batch):
 
 def get_edge_subgraphs(edge_index, spotlights, level, graphs, x_base, batch, hop=False):
     """Return one spotlight subgraph per edge.
+
+    ``graphs`` and ``x_base`` can be either:
+      - a list of per-batch nx graphs + a local feature tensor (original small-graph mode)
+      - a single nx graph + a global feature tensor (single large-graph mode).
+        in this case spotlights hold global node ids and ``batch`` is ignored.
     """
+    global_mode = isinstance(graphs, nx.Graph)
+
     subgraphs = []
     X = []
     for u, v in edge_index.T:
@@ -108,7 +115,11 @@ def get_edge_subgraphs(edge_index, spotlights, level, graphs, x_base, batch, hop
         spotlight_v = spotlights[level][v.item()]
         spotlight = spotlight_u.union(spotlight_v)
 
-        graph = graphs[batch[list(spotlight)[0]]]
+        if global_mode:
+            graph = graphs
+        else:
+            graph = graphs[batch[list(spotlight)[0]]]
+
         subgraph = graph.subgraph(spotlight).copy()
         node_features = np.stack([x_base[n].cpu().numpy() for n in sorted(list(spotlight))])
         # nx.draw(subgraph)
@@ -118,50 +129,23 @@ def get_edge_subgraphs(edge_index, spotlights, level, graphs, x_base, batch, hop
 
     return subgraphs, X
 
-def init_global_spotlights(n_id):
-    """
-    Initializes level 0 using Global Protein IDs from the loader.
-    """
-    # n_id is the tensor provided by NeighborLoader
-    return {i: {n_id[i].item()} for i in range(len(n_id))}
-
-def get_global_subgraphs(edge_index, spotlights, level, master_nx_graph, x_master):
-    """
-    Returns subgraphs and features aligned by sorted node IDs,
-    replicating the original MotiFiesta logic.
-    """
-    subgraphs = []
-    X = []
-    
-    for u, v in edge_index.T:
-        # 1. Combine spotlights to find all proteins in this motif
-        spotlight_u = spotlights[level][u.item()]
-        spotlight_v = spotlights[level][v.item()]
-        spotlight = spotlight_u.union(spotlight_v)
-        
-        # 2. SORTING: Critical for alignment between graph and features
-        sorted_nodes = sorted(list(spotlight))
-        
-        # 3. Extract induced subgraph from the global PPI network
-        subgraph = master_nx_graph.subgraph(sorted_nodes).copy()
-        
-        # 4. Align features: Stack features in the EXACT order of sorted_nodes
-        # This creates a (Num_Nodes, 25) array for THIS specific motif
-        node_features = np.stack([x_master[n].cpu().numpy() for n in sorted_nodes])
-        
-        subgraphs.append(subgraph)
-        X.append(node_features)
-
-    return subgraphs, X
-
 def get_subgraphs(node_ids, spotlights, level, graphs, x_base, batch, hop=False):
-    """Return one spotlight subgraph per node_id
+    """Return one spotlight subgraph per node_id.
+
+    same dual-mode contract as ``get_edge_subgraphs``.
     """
+    global_mode = isinstance(graphs, nx.Graph)
+
     subgraphs = []
     X = []
     for node in node_ids:
         spotlight = spotlights[level][node]
-        graph = graphs[batch[list(spotlight)[0]]]
+
+        if global_mode:
+            graph = graphs
+        else:
+            graph = graphs[batch[list(spotlight)[0]]]
+
         subgraph = graph.subgraph(spotlight).copy()
         node_features = np.stack([x_base[n].cpu().numpy() for n in sorted(list(spotlight))])
         # nx.draw(subgraph)
