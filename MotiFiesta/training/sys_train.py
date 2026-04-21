@@ -132,6 +132,7 @@ def sys_train(model,
     """
     start_time = time.time()
     device = get_device()
+    torch.manual_seed(0)
 
     os.makedirs(f'models/{model_name}', exist_ok=True)
     writer = SummaryWriter(f"logs/{model_name}")
