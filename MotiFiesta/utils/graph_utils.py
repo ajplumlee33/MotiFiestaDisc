@@ -103,10 +103,11 @@ def get_edge_subgraphs(edge_index, spotlights, level, graphs, x_base, batch, hop
 
     ``graphs`` and ``x_base`` can be either:
       - a list of per-batch nx graphs + a local feature tensor (original small-graph mode)
-      - a single nx graph + a global feature tensor (single large-graph mode).
+      - a single igraph Graph + a global feature tensor (single large-graph mode).
         in this case spotlights hold global node ids and ``batch`` is ignored.
     """
-    global_mode = isinstance(graphs, nx.Graph)
+    from igraph import Graph as IGraph
+    global_mode = isinstance(graphs, IGraph)
 
     subgraphs = []
     X = []
@@ -116,11 +117,12 @@ def get_edge_subgraphs(edge_index, spotlights, level, graphs, x_base, batch, hop
         spotlight = spotlight_u.union(spotlight_v)
 
         if global_mode:
-            graph = graphs
+            # igraph extracts subgraph by vertex indices
+            subgraph = graphs.subgraph(sorted(spotlight))
         else:
             graph = graphs[batch[list(spotlight)[0]]]
+            subgraph = graph.subgraph(spotlight).copy()
 
-        subgraph = graph.subgraph(spotlight).copy()
         node_features = np.stack([x_base[n].cpu().numpy() for n in sorted(list(spotlight))])
         # nx.draw(subgraph)
         # plt.show()

@@ -2,10 +2,10 @@ import torch
 import pandas as pd
 import os.path as osp
 
+from igraph import Graph
 import torch_geometric.transforms as T
 from torch_geometric.data import Data, Dataset
 from torch_geometric.utils import to_undirected
-from torch_geometric.utils import to_networkx
 from torch_geometric.utils import degree
 
 
@@ -26,8 +26,12 @@ class SysTxtDataset(Dataset):
 
         # load into memory once
         self.cached_data = torch.load(self.processed_paths[0], weights_only=False)
-        # store source graph as an attribute so the model can query it for "truth"
-        self.nx_graph = to_networkx(self.cached_data, to_undirected=True)
+        # store source graph as an igraph Graph for fast subgraph extraction
+        edges = self.cached_data.edge_index.t().tolist()
+        self.ig_graph = Graph(n=self.cached_data.num_nodes, edges=edges, directed=False)
+        self.ig_graph.simplify()
+        # attach vertex ids as an attribute so wwl has a per-node categorical label
+        self.ig_graph.vs['_nx_name'] = list(range(self.cached_data.num_nodes))
 
     @property
     def raw_file_names(self):
