@@ -19,6 +19,7 @@ from scipy.stats import norm
 from scipy.special import gamma
 import networkx as nx
 import matplotlib.pyplot as plt
+import numpy as np
 
 from MotiFiesta.training.edge_pool import EdgePooling
 from MotiFiesta.utils.subgraph_similarity import build_wwl_K
@@ -41,22 +42,6 @@ class MotiFiestaModel(torch.nn.Module):
                  global_pool=global_add_pool,
                  edge_score_method='sigmoid'
                  ):
-        """
-
-        :param n_features: number of input features (default=16)
-        :type n_features: int
-        :param dim: hidden dimension size (default=32)
-        :type dim: int
-        :param steps: number of contration steps to run (default=5)
-        :param steps: int
-        :param conv: whether to apply a GCN aggregation to get node embeddings.
-         should be a list conv[s] = 0 if no conv 1 if conv at each step (default=None)
-        :type conv: bool
-        :param ged_cache: whether to cache GED values for speedup
-        (default=True)
-        :type ged_cache: bool
-
-        """
         super(MotiFiestaModel, self).__init__()
 
         self.steps = steps
@@ -70,14 +55,7 @@ class MotiFiestaModel(torch.nn.Module):
 
         self.layers = self.build_layers()
 
-
     def build_layers(self):
-        """ Construct model's layers. The model consists of stacked embedding
-        and pooling layers. Embedding and pooling layers are side by side. The
-        embedding layers takes the graph at time $t$ as input and outputs a
-        node embedding for each node. The pooling layer takes the graph at time
-        $t$ as input and returns a probability for each edge.
-        """
         layers = []
         layers.append(EdgePooling(self.n_features,
                                   self.hidden_dim,
@@ -95,19 +73,7 @@ class MotiFiestaModel(torch.nn.Module):
         return torch.nn.ModuleList(layers)
 
     def forward(self, x, edge_index, batch, n_id=None, dummy=False, x_null=None, e_null=None):
-        """One forward pass applies the model over all steps (all the way up).
-        This function computes embeddings and probabilities and constructs two
-        data structures which store the history of pooling operations.
-
-        Returned embeddings, probabilities, and edge lists are lists of lists
-        where `embeddings[t]` is a list of node embeddings at time `t`.
-
-        The `merge_info` object is a dictionary with two keys, `tree` and
-        `spotlights`. The `tree` key contains a dictionary where
-        `tree[t]` contains merging info at time `t`. `tree[t][c]`
-        contains the edges (pairs of nodes) assigned to `c` at time `t`. The
-        `spotlights` dictionary contains the set of nodes in the base graph that each
-         merged node represents.
+        """One forward pass applies the model over all steps.
 
         :param x: node features
         :param edge_index: list of edges
@@ -115,8 +81,6 @@ class MotiFiestaModel(torch.nn.Module):
         :param n_id: optional global node ids from neighborloader. when provided,
             spotlights are initialised with these global ids so that subgraph lookups
             can be performed on the full graph instead of the sampled neighbourhood.
-
-        :return: node embeddings, contraction probabilities, edgelists, merge info
         """
         # fall back to local indices when no global mapping is given
         if n_id is None:
@@ -132,7 +96,6 @@ class MotiFiestaModel(torch.nn.Module):
         edge_index_initial = edge_index
         nodes_initial = nodes
 
-        # keep track of embeddings, edge scores, edge_index at each step
         xx, ee, pp = [], [], []
         batches = []
         internals = []
@@ -143,18 +106,15 @@ class MotiFiestaModel(torch.nn.Module):
                 break
             out = layer(x, edge_index, batch, hard_embed=self.hard_embed, dummy=dummy)
 
-            # record graph state at time t
             ee.append(edge_index)
             xx.append(x)
             pp.append(out['internals']['edge_scores'])
             batches.append(batch)
             internals.append(out['internals'])
 
-            # record merging events which determine state at t+1
             update_merge_graph(merge_tree, out['new_graph']['unpool'].cluster, t+1)
             update_spotlights(spotlights, out['new_graph']['unpool'].cluster, t+1)
 
-            # reset the graph to t+1 state
             edge_index = out['new_graph']['e_ind_new']
             x = out['new_graph']['x_new']
             batch = out['new_graph']['batch_new']
@@ -171,12 +131,12 @@ class MotiFiestaModel(torch.nn.Module):
                  internals,
                  num_nodes=20,
                  draw=False):
-        """Compute reconstruction loss at all coarsening
-        levels.
+        """Compute reconstruction loss at all coarsening levels.
+
         The loss function for a pair of embeddings z_1, z_2 and graph kernel K is:
         L = ((x_1 - x_2)^2  - K(g_1, g_2))^2
-        where g_1 is the spotlight of node 1
-        Here we supervise the embedding for pairs of nodes.
+        where g_1 is the spotlight of node 1. Here we supervise the embedding for
+        pairs of nodes.
         """
         # pull the full graph and its features once per call
         source_ig = source_graph.ig_graph
@@ -184,7 +144,6 @@ class MotiFiestaModel(torch.nn.Module):
 
         loss = 0
         for level in range(len(xx)):
-            # do this for all incident nodes
             x = internals[level]['x_merged']
 
             # extract spotlight subgraphs from the full graph using global ids
@@ -196,7 +155,6 @@ class MotiFiestaModel(torch.nn.Module):
                                                           None,
                                                           )
 
-            # embedding are normalized so taking distance is equivalent to cosine
             K_predict = matrix_cosine(x[:num_nodes], x[:num_nodes])
             K_predict = K_predict.to(get_device())
 
@@ -209,8 +167,6 @@ class MotiFiestaModel(torch.nn.Module):
             K_true = build_wwl_K(subgraphs[:num_nodes], formatted_features)
             K_true = K_true.to(get_device())
 
-            # if random.random() < .001:
-                # plot_K(K_true, K_predict)
             if draw:
                 for i in range(num_nodes):
                     for j in range(num_nodes):
@@ -230,9 +186,6 @@ class MotiFiestaModel(torch.nn.Module):
 
     @staticmethod
     def kde(X, X_ref, h=1):
-        """ Compute gaussian KDE estimate for each entry in
-        X with respect to X_ref
-        """
         kde = KDE(kernel='gaussian', bandwidth=h).fit(X_ref.detach().numpy())
         f = kde.score_samples(X.detach().numpy())
         f = torch.tensor(f, dtype=torch.float32)
@@ -240,12 +193,7 @@ class MotiFiestaModel(torch.nn.Module):
 
     @staticmethod
     def distance_density(X, X_ref, k=20):
-        """ Returns distance to kth nearest neighbor in
-        batch
-        """
-        # X = normalize(X)
-        # X_ref = normalize(X_ref)
-
+        """ Returns distance to kth nearest neighbor in batch """
         d = X.shape[1]
         N = X_ref.shape[0]
         knn = KDTree(X_ref.cpu().detach().numpy())
@@ -255,25 +203,16 @@ class MotiFiestaModel(torch.nn.Module):
 
     @staticmethod
     def knn_density(X, X_ref, volume=False, epsilon=1e-5, k=50):
-        """
-        \hat{f}_{X, k}(x) = \frac{k}{N} \times \frac{1}{V^{d} R_{k}(x)}$
-        where $R_{d}(x)$ is the radius of a $d$-dimensional sphere
-        (i.e. the distance to the $k$-th nearest neighbor) with
-        volume $V^{d} = \frac{\pi^{d/2}}{\Gamma(d/2 + 1)}$
-        and $\Gamma(x)$ is the Gamma function.
-        """
         d = X.shape[1]
         N = X_ref.shape[0]
         knn = KDTree(X_ref.cpu().detach().numpy())
 
         R,_ = knn.query(X.cpu().detach().numpy(), k=k)
-        # R /= min(R) + epsilon
         R = R[:,k-1]
         if volume:
             V = ((np.pi**(d/2)) / gamma(d/2 +1)) * (R**d)
             f_hat = (k / N) * (1 / V)
         else:
-            # f_hat = 1/(R + epsilon)
             f_hat = R
 
         f_hat = torch.tensor(f_hat, dtype=torch.float32, requires_grad=False)
@@ -282,9 +221,6 @@ class MotiFiestaModel(torch.nn.Module):
 
     @staticmethod
     def min_density(X, X_ref, epsilon=1e-5, k=10):
-        """
-        Estimate density as distance to nearest point.
-        """
         d = torch.cdist(X, X_ref)
         return 1/d.min(dim=1)[0]
 
@@ -299,8 +235,7 @@ class MotiFiestaModel(torch.nn.Module):
                  volume=False,
                  k=30,
                  ):
-        """ Penalize embeddings that are close to randos or sparse.
-        """
+        """ Penalize embeddings that are close to randos or sparse. """
         tot_loss = 0
         for t in range(len(pp)):
             x_pos = internals_pos[t]['x_merged']
@@ -308,7 +243,6 @@ class MotiFiestaModel(torch.nn.Module):
             s = pp[t]
 
             # cap k to the number of available reference points at this level
-            # deeper contraction levels can have fewer edges than the configured k
             k_eff = min(k, x_pos.size(0), x_neg.size(0))
             if k_eff < 2:
                 continue
@@ -317,8 +251,6 @@ class MotiFiestaModel(torch.nn.Module):
                 density_pos = self.kde(x_pos, x_pos)
                 density_neg = self.kde(x_pos, x_neg)
             if estimator == 'knn':
-                # density_pos = self.knn_density(x_pos, x_pos, k=k, volume=volume)
-                # density_neg = self.knn_density(x_pos, x_neg, k=k, volume=volume)
                 density_pos = self.distance_density(x_pos, x_pos, k=k_eff)
                 density_neg = self.distance_density(x_pos, x_neg, k=k_eff)
 
@@ -347,82 +279,106 @@ class MotiFiestaModel(torch.nn.Module):
         tot_loss /= steps
         return tot_loss
 
-    def zsc_loss_ema(self, pos_scores, neg_scores, stats):
+    def sil_loss(self, internals_pos, spotlights, tracker, momentum=0.95):
         """
-        z-score loss using running ema of a global null distribution.
-        compares pos scores against the streaming mean/std of neg scores
-        accumulated across all batches seen so far.
+        sampling invariance loss.
+
+        neighborhood sampling exposes each node to varying local contexts across
+        batches. a real motif instance should look the same regardless of which
+        neighborhood it was sampled within. this loss tracks a momentum-updated
+        target embedding for every (source_node, level) pair and penalises
+        deviations of the current batch's embedding from the target.
+
+        :param internals_pos: per-level internals returned by the forward pass
+        :param spotlights: merge_info['spotlights'] for the current batch
+        :param tracker: SamplingInvarianceTracker storing the targets
+        :param momentum: smoothing factor for the target update (0.95 default)
         """
-        # extract mean and std from the tracker
-        mu = torch.tensor(stats.mean(), device=pos_scores.device, dtype=torch.float32)
-        sigma = stats.std()
+        device = get_device()
+        tot_loss = torch.zeros(1, device=device)
+        n_terms = 0
 
-        # high z-score means the motif is significantly over-represented
-        z_scores = (pos_scores - mu) / (sigma + 1e-8)
+        for level in range(len(internals_pos)):
+            x_level = internals_pos[level]['x_merged']
+            if x_level.size(0) == 0:
+                continue
 
-        # minimising this forces the gnn to find highly significant motifs
-        loss = -z_scores.mean()
+            # normalize to compare direction rather than magnitude
+            h_cur = F.normalize(x_level, dim=-1)
 
-        # penalty when the null scores drift from their running mean
-        # prevents the model from collapsing the null distribution
-        regularization = F.mse_loss(neg_scores, mu.expand_as(neg_scores))
+            # each supernode at this level represents one spotlight; we anchor the
+            # target to the sorted spotlight tuple so it is stable across batches
+            for node_idx in range(x_level.size(0)):
+                spot = spotlights[level].get(node_idx)
+                if not spot:
+                    continue
+                key = tuple(sorted(spot))
 
-        return loss + 0.1 * regularization
+                target = tracker.get(key, level)
+                if target is None:
+                    # first sighting: seed the target with the current embedding
+                    tracker.set(key, level, h_cur[node_idx].detach())
+                    continue
 
-    def zsc_loss_local(self, pos_scores, null_scores):
-        """
-        z-score loss using a local null distribution.
-        null_scores is a tensor of k null realisations of the same pos batch.
-        mu and sigma are computed from those k samples, giving a per-batch
-        z-score that matches the classical network motif definition.
-        """
-        mu = null_scores.mean()
-        sigma = null_scores.std(unbiased=False)
+                target = target.to(device)
+                tot_loss = tot_loss + (1.0 - (h_cur[node_idx] * target).sum())
+                n_terms += 1
 
-        # high z-score means the motif is significantly over-represented
-        z_scores = (pos_scores - mu) / (sigma + 1e-8)
+                # ema update of the target; detach to keep it out of the graph
+                new_target = momentum * target + (1.0 - momentum) * h_cur[node_idx].detach()
+                new_target = F.normalize(new_target, dim=-1)
+                tracker.set(key, level, new_target)
 
-        # minimising this forces the gnn to find highly significant motifs
-        loss = -z_scores.mean()
+        if n_terms == 0:
+            return torch.zeros(1, device=device).squeeze()
+        return (tot_loss / n_terms).squeeze()
 
-        return loss
+
+class SamplingInvarianceTracker:
+    """
+    stores momentum-updated target embeddings keyed by (spotlight, level).
+
+    the spotlight (a tuple of original node ids) identifies a persistent motif
+    candidate across batches even though neighborhood sampling varies the
+    surrounding context each time. level is the contraction depth at which the
+    embedding was produced.
+    """
+    def __init__(self):
+        self.store = {}
+
+    def get(self, key, level):
+        return self.store.get((key, level))
+
+    def set(self, key, level, value):
+        self.store[(key, level)] = value.detach().cpu()
+
+    def __len__(self):
+        return len(self.store)
+
 
 def matrix_cosine(a, b, eps=1e-8):
-    """
-    Pairwise cosine of embeddings
-    """
     a_n, b_n = a.norm(dim=1)[:, None], b.norm(dim=1)[:, None]
     a_norm = a / torch.max(a_n, eps * torch.ones_like(a_n))
     b_norm = b / torch.max(b_n, eps * torch.ones_like(b_n))
     sim_mt = torch.mm(a_norm, b_norm.transpose(0, 1))
     return sim_mt
 
+
 class HardEmbedder(torch.nn.Module):
     def __init__(self, out_dim):
         super(HardEmbedder, self).__init__()
         self.out_dim = out_dim
-        # self.linear_relu_stack = torch.nn.Sequential(
-            # torch.nn.Linear(50, out_dim),
-            # torch.nn.ReLU(),
-        # )
-
 
     def forward(self, t, spotlights, edge_index_initial, nodes_initial):
-        """ For now just compute a degree histogram.
-        """
         G = nx.Graph()
         G.add_nodes_from(range(len(nodes_initial)))
         G.add_edges_from(zip(*edge_index_initial.cpu().detach().numpy()))
 
         edge_index_initial.to(get_device())
 
-        # nx.draw(G)
-        # plt.show()
-
         def spotlight_graph(node):
             return G.subgraph(spotlights[t][node]).copy()
 
-        # embeddings = torch.Tensor((len(spotlights[t]), 50))
         embeddings = []
         for pool_node in range(len(spotlights[t])):
             subg = spotlight_graph(pool_node)
@@ -432,14 +388,12 @@ class HardEmbedder(torch.nn.Module):
                 degs = Counter((subg.degree(n) for n in subg.nodes()))
 
             deg_hist = [degs[ind] for ind in range(self.out_dim)]
-            # if t > 0:
-                # nx.draw(subg)
-                # plt.show()
             embeddings.append(torch.Tensor(deg_hist))
             pass
 
         embeddings = torch.stack(embeddings)
         return embeddings
+
 
 def plot_K(K_true, K_pred):
     fig, ax = plt.subplots(1, 2)
@@ -447,6 +401,7 @@ def plot_K(K_true, K_pred):
     sns.heatmap(K_pred.detach().numpy(), vmin=0, vmax=1, ax=ax[1])
     plt.show()
     pass
+
 
 if __name__ == "__main__":
     import doctest

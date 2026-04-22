@@ -7,6 +7,7 @@ import torch
 from igraph import Graph
 from wwl import wwl
 
+
 def build_K(subgraphs, cache=None):
     graph_pairs = ((*c, cache) for c in combinations(subgraphs, 2))
     d = list(starmap(subgraph_sim_dgl, graph_pairs))
@@ -19,8 +20,14 @@ def build_K(subgraphs, cache=None):
 
     return torch.tensor(block, dtype=torch.float)
 
+
 def build_wwl_K(graphs, node_features=None):
-    # convert nx inputs to igraph; pass igraph inputs through unchanged
+    """ wwl kernel matrix over a list of graphs.
+
+    accepts either a list of nx graphs (original collection mode) or a list of
+    igraph graphs (single-graph mode, where subgraphs are extracted from the
+    source ig_graph). nx inputs are converted once; igraph inputs pass through.
+    """
     if len(graphs) > 0 and not isinstance(graphs[0], Graph):
         graphs = [Graph.from_networkx(g) for g in graphs]
     kernel_matrix = wwl(graphs,
@@ -29,8 +36,10 @@ def build_wwl_K(graphs, node_features=None):
                         )
     return torch.tensor(kernel_matrix, dtype=torch.float)
 
+
 def subgraph_sim(sg1, sg2, timeout=1):
     return nx.algorithms.graph_edit_distance(sg1, sg2, timeout=timeout)
+
 
 def subgraph_sim_dgl(sg1, sg2, cache, beta=.5, node_attr=None, edge_attr=None):
     G1 = dgl.from_networkx(sg1)
