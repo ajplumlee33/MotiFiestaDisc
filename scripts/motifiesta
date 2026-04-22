@@ -28,7 +28,6 @@ except IndexError:
 
 print(f"== {function} mode ==")
 
-# train the motif pooling model
 if function == 'train':
     parser = argparse.ArgumentParser()
     parser.add_argument("--name", "-n", type=str, default="default")
@@ -36,33 +35,30 @@ if function == 'train':
     parser.add_argument("--data_root", type=str, default='.')
     parser.add_argument("--restart", "-r", action='store_true', default=False,  help='Restart model.')
     parser.add_argument("--disc", "-di", action='store_true', default=False,  help='Discovery mode.')
-    parser.add_argument("--mode", "-md", default='combined',  help='Loss mode.')
+    parser.add_argument("--mode", "-md", default='combined',
+                        choices=['mot', 'sil', 'combined'],
+                        help='Loss mode. mot = density loss only, sil = sampling invariance loss only, combined = both.')
 
-    # training  loop
     parser.add_argument("--batch-size", "-b", type=int, default=16)
     parser.add_argument("--max-batches", "-m", type=int, default=-1)
     parser.add_argument("--epochs", "-e", type=int, default=200)
     parser.add_argument("--stop-epochs", type=int, default=30, help="Number of epochs to train embeddings before doing motifs.")
     parser.add_argument("--attributed", default=False, action='store_true', help="Use attributed graphs. If False, use node degree as features.")
 
-    # learning
     parser.add_argument("--lam",  type=float, default=1)
     parser.add_argument("--beta", type=float, default=1)
     parser.add_argument("--estimator", "-es", type=str, default='knn', help="Which density estimator to use for the motif agg. step")
     parser.add_argument("--n-neighbors", "-nn", type=int, default=30, help="Number of neighbors")
     parser.add_argument("--volume", "-vv", action='store_true', default=False, help="Use d-sphere volume to normalize density with kNN.")
-    parser.add_argument("--zsc-method", type=str, default='ema', choices=['ema', 'local'],
-                        help="z-score loss method: 'ema' uses streaming null stats, 'local' uses k nulls per positive sample")
-    parser.add_argument("--zsc-k", type=int, default=10,
-                        help="number of null realisations per positive sample (only used when --zsc-method local)")
+    parser.add_argument("--sil-momentum", type=float, default=0.95,
+                        help="EMA momentum for the sampling invariance tracker (higher = more stable targets)")
 
-    # model architecture
     parser.add_argument("--steps", "-s", type=int, default=5)
     parser.add_argument("--dim", "-d", type=int, default=8)
     parser.add_argument("--pool-dummy", action="store_true", default=False)
-    parser.add_argument("--score-method", default="sigmoid", help="Edge soring method: (sigmoid, softmax-neighbors, softmax-all)")
+    parser.add_argument("--score-method", default="sigmoid", help="Edge scoring method: (sigmoid, softmax-neighbors, softmax-all)")
     parser.add_argument("--merge-method", default="sum", help="Edge merge method: (sum, cat, set2set)")
-    parser.add_argument("--hard-embed", action='store_true', help="Whether to use hard embedding using degree histogram. ")
+    parser.add_argument("--hard-embed", action='store_true', help="Whether to use hard embedding using degree histogram.")
 
     args, _ = parser.parse_known_args()
     print(args)
@@ -89,8 +85,8 @@ if function == 'train':
                         'k': args.n_neighbors,
                         'volume': args.volume,
                         'attributed': args.attributed,
-                        'zsc_method': args.zsc_method,
-                        'zsc_k': args.zsc_k,
+                        'mode': args.mode,
+                        'sil_momentum': args.sil_momentum,
                         }
                 }
 
@@ -145,8 +141,7 @@ if function == 'train':
                     test_loader=data['loader_test'],
                     source_graph=data['dataset_whole'],
                     mode=args.mode,
-                    zsc_method=args.zsc_method,
-                    zsc_k=args.zsc_k,
+                    sil_momentum=args.sil_momentum,
                     model_name=args.name,
                     epochs=args.epochs,
                     max_batches=args.max_batches,

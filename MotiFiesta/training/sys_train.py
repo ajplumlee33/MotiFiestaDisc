@@ -8,31 +8,30 @@ from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
 from MotiFiesta.utils.learning_utils import get_device
-from MotiFiesta.utils.stats import RunningStats
-from MotiFiesta.utils.sys_loader import fast_vectorized_swap
+from MotiFiesta.training.model import SamplingInvarianceTracker
+from MotiFiesta.utils.sys_txt import rewire
 
 
 class Controller:
     """
-    tracks training progress and decides when to switch phases
+    tracks training progress and decides when to switch phases.
+    rec is always active; other modules depend on mode.
     """
-    def __init__(self, since_best_threshold=30, mode='freq'):
+    def __init__(self, since_best_threshold=30, mode='combined'):
         self.since_best_threshold = since_best_threshold
         self.mode = mode
 
-        # rec is always active; mode determines others
-        if mode == 'freq':
+        if mode == 'mot':
             self.modules = ['rec', 'mot']
-        elif mode == 'zscore':
-            self.modules = ['rec', 'zsc']
-        else: # combined
-            self.modules = ['rec', 'mot', 'zsc']
+        elif mode == 'sil':
+            self.modules = ['rec', 'sil']
+        else:  # combined
+            self.modules = ['rec', 'mot', 'sil']
 
         self.best_losses = {key: {'best_loss': float('nan'), 'since_best': 0}
                             for key in self.modules}
 
     def keep_going(self, key):
-        """ Returns True if model should keep training, false otherwise."""
         return self.best_losses[key]['since_best'] <= self.since_best_threshold
 
     def update(self, losses):
@@ -57,20 +56,18 @@ class Controller:
 
     def set_state(self, state_dict):
         self.since_best_threshold = state_dict['since_best_threshold']
-        self.mode = state_dict.get('mode', 'freq')
+        self.mode = state_dict.get('mode', 'combined')
         self.modules = state_dict['modules']
         self.best_losses = state_dict['best_losses']
 
 
 def _get_batch_vec(data, device):
-    """ fall back to zeros when the loader yields a single subgraph """
     if hasattr(data, 'batch') and data.batch is not None:
         return data.batch.to(device)
     return torch.zeros(data.x.size(0), dtype=torch.long, device=device)
 
 
 def _get_n_id(data, device):
-    """ global node mapping from neighborloader """
     if hasattr(data, 'n_id') and data.n_id is not None:
         return data.n_id.to(device)
     return torch.arange(data.x.size(0), device=device)
@@ -82,16 +79,15 @@ def _forward(model, data, device):
     return model(data.x, data.edge_index, b_vec, n_id=n_id)
 
 
-def _pp_mean(pp):
-    """ mean edge score across all contraction levels """
-    return torch.stack([p.mean() for p in pp]).mean()
-
-
-def _make_neg(pos):
-    """ produce a single rewired null from a positive batch """
-    neg = pos.clone()
-    neg.edge_index = fast_vectorized_swap(pos.edge_index)
-    return neg
+def _make_neg(pos, n_iter=100):
+    """
+    produce a rewired null from a positive batch via classical double edge swap.
+    preserves the degree sequence.
+    """
+    # rewire operates on a cpu pyg Data; push back to the original device
+    device = pos.x.device
+    neg = rewire(pos.cpu(), n_iter=n_iter)
+    return neg.to(device)
 
 
 def sys_train(model,
@@ -99,8 +95,7 @@ def sys_train(model,
                 test_loader,
                 source_graph,
                 mode='combined',
-                zsc_method='ema',
-                zsc_k=10,
+                sil_momentum=0.95,
                 model_name='default',
                 estimator='knn',
                 epochs=200,
@@ -121,9 +116,8 @@ def sys_train(model,
     :param train_loader: loader yielding {'pos'} neighborhood batches
     :param test_loader: same format as train_loader
     :param source_graph: dataset providing the full graph for rec_loss subgraph lookup
-    :param mode: which motif losses to activate ('freq', 'zscore', 'combined')
-    :param zsc_method: 'ema' (global streaming null) or 'local' (per-sample null from k rewires)
-    :param zsc_k: number of null realisations per pos batch when zsc_method is 'local'
+    :param mode: which motif losses to activate ('mot', 'sil', 'combined')
+    :param sil_momentum: ema momentum for the sampling invariance tracker
     :param model_name: ID to save model under
     :param epochs: number of epochs to train
     :param lam: loss coefficient for edge scores
@@ -132,6 +126,8 @@ def sys_train(model,
     """
     start_time = time.time()
     device = get_device()
+
+    # fix the rng trajectory so runs are reproducible
     torch.manual_seed(0)
 
     os.makedirs(f'models/{model_name}', exist_ok=True)
@@ -146,10 +142,9 @@ def sys_train(model,
     if optimizer is None:
         optimizer = torch.optim.Adam(model.parameters())
 
-    # running statistics of the null distribution for the ema z-score
-    stats = RunningStats(momentum=0.95)
+    sil_tracker = SamplingInvarianceTracker()
 
-    rec_loss, mot_loss, zsc_loss = [torch.tensor(float('nan'))] * 3
+    rec_loss, mot_loss, sil_loss = [torch.tensor(float('nan'))] * 3
     done_training = False
 
     for epoch in range(epoch_start, epochs):
@@ -163,7 +158,7 @@ def sys_train(model,
         num_batches = len(train_loader)
         n_train = max_batches if max_batches > 0 else num_batches
 
-        rec_loss_tot, mot_loss_tot, zsc_loss_tot = [0] * 3
+        rec_loss_tot, mot_loss_tot, sil_loss_tot = [0] * 3
 
         for batch_idx, batch in tqdm(enumerate(train_loader), total=n_train):
             if batch_idx >= max_batches and max_batches > 0:
@@ -173,11 +168,9 @@ def sys_train(model,
 
             optimizer.zero_grad()
 
-            # do main forward pass
             xx_pos, pp_pos, ee_pos, _, merge_info_pos, internals_pos = _forward(model, pos, device)
 
             loss = 0
-
             backward = False
             warmup_done = False
 
@@ -196,12 +189,10 @@ def sys_train(model,
                 warmup_done = True
 
             if warmup_done:
-                # primary null used by freq_loss and the ema z-score path
-                neg = _make_neg(pos)
-                xx_neg, pp_neg, ee_neg, _, merge_info_neg, internals_neg = _forward(model, neg, device)
+                if mode in ('mot', 'combined') and controller.keep_going('mot'):
+                    neg = _make_neg(pos)
+                    xx_neg, pp_neg, ee_neg, _, merge_info_neg, internals_neg = _forward(model, neg, device)
 
-                # penalises embeddings whose neighborhood density exceeds the null
-                if mode in ('freq', 'combined') and controller.keep_going('mot'):
                     mot_loss = model.freq_loss(internals_pos,
                                                internals_neg,
                                                pp_pos,
@@ -212,41 +203,18 @@ def sys_train(model,
                                                lam=lam,
                                                beta=beta
                                                )
-
                     loss += mot_loss
                     mot_loss_tot += mot_loss.item()
                     backward = True
 
-                # rewards embeddings that are significantly over-represented vs the null
-                if mode in ('zscore', 'combined') and controller.keep_going('zsc'):
-
-                    if zsc_method == 'ema':
-                        # accumulate null scores in the streaming stats
-                        neg_sc = _pp_mean(pp_neg)
-                        stats.push(neg_sc.detach())
-
-                        # skip until the running stats have enough samples for a valid sigma
-                        if stats.count > 1:
-                            pos_sc = _pp_mean(pp_pos)
-                            zsc_loss = model.zsc_loss_ema(pos_sc, neg_sc, stats)
-                            loss += zsc_loss * lam
-                            zsc_loss_tot += zsc_loss.item()
-                            backward = True
-
-                    elif zsc_method == 'local':
-                        # reuse the freq null as the first sample to save a forward pass
-                        null_scores = [_pp_mean(pp_neg)]
-                        for _ in range(zsc_k - 1):
-                            neg_extra = _make_neg(pos)
-                            _, pp_neg_extra, _, _, _, _ = _forward(model, neg_extra, device)
-                            null_scores.append(_pp_mean(pp_neg_extra))
-                        null_scores = torch.stack(null_scores)
-
-                        pos_sc = _pp_mean(pp_pos)
-                        zsc_loss = model.zsc_loss_local(pos_sc, null_scores)
-                        loss += zsc_loss * lam
-                        zsc_loss_tot += zsc_loss.item()
-                        backward = True
+                if mode in ('sil', 'combined') and controller.keep_going('sil'):
+                    sil_loss = model.sil_loss(internals_pos,
+                                              merge_info_pos['spotlights'],
+                                              sil_tracker,
+                                              momentum=sil_momentum)
+                    loss += sil_loss * lam
+                    sil_loss_tot += sil_loss.item()
+                    backward = True
 
             if backward:
                 loss.backward()
@@ -259,11 +227,11 @@ def sys_train(model,
 
         losses = {'rec': rec_loss_tot / N,
                   'mot': mot_loss_tot / N,
-                  'zsc': zsc_loss_tot / N,
+                  'sil': sil_loss_tot / N,
                   }
 
         ## END OF BATCHES ##
-        rec_loss_tot, mot_loss_tot, zsc_loss_tot = [0] * 3
+        rec_loss_tot, mot_loss_tot, sil_loss_tot = [0] * 3
 
         model.eval()
 
@@ -276,12 +244,13 @@ def sys_train(model,
             pos = batch['pos'].to(device)
 
             with torch.no_grad():
-                # do main forward pass
                 xx_pos, pp_pos, ee_pos, _, merge_info_pos, internals_pos = _forward(model, pos, device)
 
             warmup_done = False
 
             rec_loss = torch.tensor(float('nan'))
+            mot_loss = torch.tensor(float('nan'))
+            sil_loss = torch.tensor(float('nan'))
 
             if controller.keep_going('rec'):
                 rec_loss = model.rec_loss(xx_pos,
@@ -293,16 +262,12 @@ def sys_train(model,
             else:
                 warmup_done = True
 
-            mot_loss = torch.tensor(float('nan'))
-            zsc_loss = torch.tensor(float('nan'))
-
             if warmup_done:
-                neg = _make_neg(pos)
+                if mode in ('mot', 'combined'):
+                    neg = _make_neg(pos)
+                    with torch.no_grad():
+                        xx_neg, pp_neg, ee_neg, _, merge_info_neg, internals_neg = _forward(model, neg, device)
 
-                with torch.no_grad():
-                    xx_neg, pp_neg, ee_neg, _, merge_info_neg, internals_neg = _forward(model, neg, device)
-
-                if mode in ('freq', 'combined'):
                     mot_loss = model.freq_loss(internals_pos,
                                                internals_neg,
                                                pp_pos,
@@ -314,33 +279,21 @@ def sys_train(model,
                                                beta=beta
                                                )
 
-                if mode in ('zscore', 'combined'):
-                    if zsc_method == 'ema' and stats.count > 1:
-                        pos_sc = _pp_mean(pp_pos)
-                        neg_sc = _pp_mean(pp_neg)
-                        zsc_loss = model.zsc_loss_ema(pos_sc, neg_sc, stats)
-
-                    elif zsc_method == 'local':
-                        null_scores = [_pp_mean(pp_neg)]
-                        for _ in range(zsc_k - 1):
-                            neg_extra = _make_neg(pos)
-                            with torch.no_grad():
-                                _, pp_neg_extra, _, _, _, _ = _forward(model, neg_extra, device)
-                            null_scores.append(_pp_mean(pp_neg_extra))
-                        null_scores = torch.stack(null_scores)
-
-                        pos_sc = _pp_mean(pp_pos)
-                        zsc_loss = model.zsc_loss_local(pos_sc, null_scores)
+                if mode in ('sil', 'combined'):
+                    sil_loss = model.sil_loss(internals_pos,
+                                              merge_info_pos['spotlights'],
+                                              sil_tracker,
+                                              momentum=sil_momentum)
 
             rec_loss_tot += rec_loss.item()
             mot_loss_tot += mot_loss.item()
-            zsc_loss_tot += zsc_loss.item()
+            sil_loss_tot += sil_loss.item()
 
         N = max_batches if max_batches > 0 else len(test_loader)
 
         test_losses = {'rec': rec_loss_tot / N,
                        'mot': mot_loss_tot / N,
-                       'zsc': zsc_loss_tot / N,
+                       'sil': sil_loss_tot / N,
                        }
 
         controller.update(test_losses)
@@ -363,7 +316,6 @@ def sys_train(model,
               f" Time: {time_elapsed:.2f}"
               )
 
-        # tensorboard logging
         step = epoch * num_batches + batch_idx
         for k, v in losses.items():
             writer.add_scalar(f"train_{k}", v, step)

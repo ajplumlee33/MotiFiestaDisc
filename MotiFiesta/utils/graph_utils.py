@@ -22,7 +22,6 @@ def induced_edge_filter_(G, roots, depth=1):
         :param depth: size of neighbourhood to take around each node.
         :returns clean_g: cleaned graph
     """
-    # a depth of zero does not make sense for this operation as it would remove all edges
     if depth < 1:
         depth = 1
     neighbourhoods = []
@@ -35,7 +34,6 @@ def induced_edge_filter_(G, roots, depth=1):
     flat_neighbors = list(flat_neighbors)
     subG = G.subgraph(flat_neighbors)
     subG = subG.copy()
-    # G_new = G_new.subgraph(flat_neighbors)
     kill = []
     for (u, v) in subG.edges():
         for nei in neighbourhoods:
@@ -55,11 +53,6 @@ def induced_edge_filter(G, roots):
     G.remove_edges_from(kill)
 
 def bfs_expand(G, initial_nodes, hops=2):
-    """
-        Extend motif graph starting with motif_nodes.
-        Returns list of nodes.
-    """
-
     total_nodes = [list(initial_nodes)]
     for d in range(hops):
         depth_ring = []
@@ -68,16 +61,10 @@ def bfs_expand(G, initial_nodes, hops=2):
                 depth_ring.append(nei)
         else:
             total_nodes.append(depth_ring)
-        # total_nodes.append(depth_ring)
     return set(itertools.chain(*total_nodes))
 
 
 def bfs(G, initial_node, depth=2):
-    """
-        Generator for bfs given graph and initial node.
-        Yields nodes at next hop at each call.
-    """
-
     total_nodes = [[initial_node]]
     visited = []
     for d in range(depth):
@@ -98,16 +85,25 @@ def to_graphs(batch):
               for i in range(batch.num_graphs)]
     return graphs
 
+
+def _is_single_source_graph(graphs):
+    """
+    single-graph mode passes one igraph.Graph instead of a list of nx graphs.
+    detecting by igraph class keeps the collection-mode path untouched.
+    """
+    from igraph import Graph as IGraph
+    return isinstance(graphs, IGraph)
+
+
 def get_edge_subgraphs(edge_index, spotlights, level, graphs, x_base, batch, hop=False):
     """Return one spotlight subgraph per edge.
 
-    ``graphs`` and ``x_base`` can be either:
-      - a list of per-batch nx graphs + a local feature tensor (original small-graph mode)
-      - a single igraph Graph + a global feature tensor (single large-graph mode).
-        in this case spotlights hold global node ids and ``batch`` is ignored.
+    in the original collection mode, ``graphs`` is a list of per-batch nx
+    subgraphs and ``batch`` routes each spotlight to the right one. in
+    single-graph mode (used by sys_train / systxt), ``graphs`` is a single
+    igraph.Graph spanning the full source graph and ``batch`` is ignored.
     """
-    from igraph import Graph as IGraph
-    global_mode = isinstance(graphs, IGraph)
+    single = _is_single_source_graph(graphs)
 
     subgraphs = []
     X = []
@@ -116,42 +112,36 @@ def get_edge_subgraphs(edge_index, spotlights, level, graphs, x_base, batch, hop
         spotlight_v = spotlights[level][v.item()]
         spotlight = spotlight_u.union(spotlight_v)
 
-        if global_mode:
-            # igraph extracts subgraph by vertex indices
+        if single:
             subgraph = graphs.subgraph(sorted(spotlight))
         else:
             graph = graphs[batch[list(spotlight)[0]]]
             subgraph = graph.subgraph(spotlight).copy()
 
         node_features = np.stack([x_base[n].cpu().numpy() for n in sorted(list(spotlight))])
-        # nx.draw(subgraph)
-        # plt.show()
         subgraphs.append(subgraph)
         X.append(node_features)
 
     return subgraphs, X
 
 def get_subgraphs(node_ids, spotlights, level, graphs, x_base, batch, hop=False):
-    """Return one spotlight subgraph per node_id.
-
-    same dual-mode contract as ``get_edge_subgraphs``.
+    """Return one spotlight subgraph per node_id. same dual-mode contract as
+    get_edge_subgraphs.
     """
-    global_mode = isinstance(graphs, nx.Graph)
+    single = _is_single_source_graph(graphs)
 
     subgraphs = []
     X = []
     for node in node_ids:
         spotlight = spotlights[level][node]
 
-        if global_mode:
-            graph = graphs
+        if single:
+            subgraph = graphs.subgraph(sorted(spotlight))
         else:
             graph = graphs[batch[list(spotlight)[0]]]
+            subgraph = graph.subgraph(spotlight).copy()
 
-        subgraph = graph.subgraph(spotlight).copy()
         node_features = np.stack([x_base[n].cpu().numpy() for n in sorted(list(spotlight))])
-        # nx.draw(subgraph)
-        # plt.show()
         subgraphs.append(subgraph)
         X.append(node_features)
 
@@ -175,8 +165,7 @@ def get_subgraph_edge(u, v, spotlights, level, graphs, batch, hop=False):
     return graph.subgraph(spotlight_uv).copy()
 
 def expand_spotlights(spotlights, t, edge_index, k):
-    """ Merge k-hop neighbhourhood spotlights.
-    """
+    """ Merge k-hop neighbhourhood spotlights. """
     if k < 1:
         return
     nodes = range(len(spotlights[t]))
@@ -196,10 +185,7 @@ def expand_spotlights(spotlights, t, edge_index, k):
     pass
 
 def update_spotlights(spotlights, clusters, t):
-    """ Keeps track of the spotlight of each node:
-
-        spotlight(u^0) = u
-        spotlight(u^t) = UNION(SPOTLIGHT(children(u)))
+    """ Keeps track of the spotlight of each node.
 
         >>> from collections import defaultdict
         >>> import torch
@@ -209,7 +195,6 @@ def update_spotlights(spotlights, clusters, t):
         >>> SL
         {0: {0: {1, 2}, 1: {3, 4}}, 1: defaultdict(<class 'set'>, {0: {1, 2, 3, 4}})}
     """
-
     spotlights[t] = defaultdict(set)
     for i,c in enumerate(clusters):
         spotlights[t][c.item()] |= spotlights[t-1][i]
@@ -236,7 +221,6 @@ def ablate_graphs(graphs, method='swap', n_swaps=5):
     for g in graphs:
         graph_swap = g.copy().to_undirected()
         connected_double_edge_swap(graph_swap, nswap=n_swaps)
-        # need to fix this to work with directed graphs
         graphs_swap.append(graph_swap.to_directed())
 
     return graphs_swap
@@ -254,7 +238,6 @@ def batch_to_node_indices(batch):
     current_batch = batch[0]
     ind = 1
     for b in batch[1:]:
-        # start over if we are in a new batch
         if b != current_batch:
             ind = 0
             current_batch = b
