@@ -60,6 +60,35 @@ if function == 'train':
     parser.add_argument("--merge-method", default="sum", help="Edge merge method: (sum, cat, set2set)")
     parser.add_argument("--hard-embed", action='store_true', help="Whether to use hard embedding using degree histogram.")
 
+    # --- Synthetic single-graph dataset flags (used only when data_root --
+    # contains 'sys_synth'; silently ignored otherwise) -----------------------
+    parser.add_argument("--motif-type", type=str, default='clique',
+                        choices=['star', 'barbell', 'wheel', 'random',
+                                 'clique', 'lollipop'],
+                        help="Motif type to plant. Same names as "
+                             "synthetic.generate_instances.")
+    parser.add_argument("--motif-size", type=int, default=5,
+                        help="Motif size knob, interpreted by motif_menu "
+                             "(matches generate_instances semantics).")
+    parser.add_argument("--n-motifs", type=int, default=10,
+                        help="Number of motif instances to plant.")
+    parser.add_argument("--parent-size", type=int, default=1000,
+                        help="Parent graph size for SysSyntheticDataset.")
+    parser.add_argument("--parent-e-prob", type=float, default=0.005,
+                        help="Erdős-Rényi edge probability for the parent graph.")
+    parser.add_argument("--random-e-prob", type=float, default=None,
+                        help="Edge probability used when motif_type='random'. "
+                             "Defaults to parent-e-prob, but for single-graph "
+                             "mode the parent is sparse so random motifs end "
+                             "up empty — override to ~0.3-0.5 for visible "
+                             "random motifs.")
+    parser.add_argument("--distort-p", type=float, default=0.0,
+                        help="Per-edge distortion probability applied to each "
+                             "planted motif instance. 0.0 = exact topology.")
+    parser.add_argument("--dataset-seed", type=int, default=0,
+                        help="RNG seed for synthetic dataset generation. "
+                             "Separate from training RNG.")
+
     args, _ = parser.parse_known_args()
     print(args)
 
@@ -90,12 +119,30 @@ if function == 'train':
                         }
                 }
 
+    # Build synth-dataset kwargs only when the data_root asks for it.
+    # get_loader filters these to the keys SysSyntheticDataset accepts,
+    # so this is belt-and-suspenders — but keeping the build explicit
+    # makes the CLI's intent readable.
+    loader_extra = {}
+    if 'sys_synth' in args.data_root:
+        loader_extra['motif_type'] = args.motif_type
+        loader_extra['motif_size'] = args.motif_size
+        loader_extra['n_motifs'] = args.n_motifs
+        loader_extra['parent_size'] = args.parent_size
+        loader_extra['parent_e_prob'] = args.parent_e_prob
+        if args.random_e_prob is not None:
+            loader_extra['random_e_prob'] = args.random_e_prob
+        loader_extra['distort_p'] = args.distort_p
+        loader_extra['seed'] = args.dataset_seed
+        print(f">>> sys_synth kwargs: {loader_extra}")
+
     print(">>> loading data")
     data = get_loader(
                       name=args.dataset,
                       root=args.data_root,
                       batch_size=hparams['train']['batch_size'],
                       attributed=hparams['train']['attributed'],
+                      **loader_extra,
                       )
 
     hparams['model']['n_features'] = data['dataset_whole'].num_features
