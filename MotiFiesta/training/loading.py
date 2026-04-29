@@ -9,6 +9,7 @@ from torch_geometric.data import DataLoader
 from MotiFiesta.utils.synthetic import SyntheticMotifs
 from MotiFiesta.utils.real_world import RealWorldDataset
 from MotiFiesta.utils.sys_txt import SysTxtDataset
+from MotiFiesta.utils.sys_synthetic import SysSyntheticDataset  # NEW
 from MotiFiesta.utils.sys_loader import SysLoader
 
 
@@ -20,21 +21,32 @@ def get_loader(root,
     """
     Arguments
     ----------
-    root: 
+    root:
         path to folder for storing the dataset
-    name: 
+    name:
         ID of dataset (options: 'synthetic' generates synthetic motifs, else the string ID of a PyG dataset
 
     Returns
     -------
-    
+
     dict:
-        Dictionary with loaders and datasets for train/test 
+        Dictionary with loaders and datasets for train/test
 
     """
     if 'mips_torch' in root:
         print(">>> SUCCESS: Systems dataset detected")
         dataset = SysTxtDataset(root=root)
+    elif 'sys_synth' in root:
+        # NEW: single-graph synthetic dataset with planted motif ground truth.
+        # Extract only the kwargs this class actually accepts — callers like
+        # the CLI pass `attributed=...` and other flags meant for other
+        # branches, and forwarding them blindly would TypeError here.
+        print(">>> SUCCESS: Synthetic systems dataset detected")
+        _synth_keys = ('motif_type', 'motif_size', 'n_motifs',
+                       'parent_size', 'parent_e_prob', 'random_e_prob',
+                       'distort_p', 'seed', 'max_degree', 'n_features')
+        _synth_kwargs = {k: kwargs[k] for k in _synth_keys if k in kwargs}
+        dataset = SysSyntheticDataset(root=root, **_synth_kwargs)
     else:
         print(">>> FAIL: Falling back to RealWorldDataset")
         if not name.startswith('synth'):
