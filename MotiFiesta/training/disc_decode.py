@@ -41,9 +41,9 @@ class DiscHashDecoder(Decoder):
 
     when ground truth is present on the input graph (is_motif and motif_id node
     attributes, as produced by synthetic.py), also computes evaluation metrics:
-        pattern-level precision/recall against planted g6 labels,
-        node-level jaccard against planted motif nodes,
-        instance-level recall against planted motif instances.
+        pattern-level precision/recall against embedded g6 labels,
+        node-level jaccard against embedded motif nodes,
+        instance-level recall against embedded motif instances.
     """
 
     def __init__(self,
@@ -298,21 +298,22 @@ class DiscHashDecoder(Decoder):
         }
 
     # ------------------------------------------------------------------
-    # evaluation against planted ground truth
+    # evaluation against embedded ground truth
     # ------------------------------------------------------------------
 
     def _has_ground_truth(self, results):
-        """ detect whether the input data has planted motif annotations. """
+        """ detect whether the input data has embedded motif annotations. """
         if not results:
             return False
         pyg = results[0]['pyg']
         return hasattr(pyg, 'motif_id') and pyg.motif_id is not None
 
-    def _planted_g6s(self, results):
+    def _embedded_g6s(self, results):
         """
-        return the set of canonical g6 labels of the planted motif instances.
-        derived by taking the induced subgraph of each planted instance
-        (grouped by motif_id) and canonicalising.
+        return the set of canonical g6 labels of the embedded motif topologies.
+        groups nodes by motif_id (motif type), then splits each group into
+        connected components so multiple instances of the same type each
+        contribute their own topology label (which deduplicates in the set).
         """
         g6s = set()
         for res in results:
@@ -326,50 +327,16 @@ class DiscHashDecoder(Decoder):
                 if mid > 0:
                     groups[mid].add(node_idx)
             for mid, nodes in groups.items():
-                sub, _ = self._induced_subgraph(source_nx, nodes)
-                if sub.number_of_nodes() >= 2 and sub.number_of_edges() > 0:
+                sub_all = source_nx.subgraph(nodes)
+                # each connected component is one embedded instance
+                for component in nx.connected_components(sub_all):
+                    if len(component) < 2:
+                        continue
+                    sub, _ = self._induced_subgraph(source_nx, component)
+                    if sub.number_of_edges() == 0:
+                        continue
                     g6s.add(self._graph6(sub))
         return g6s
-
-    def _planted_instances(self, results):
-        """
-        return a list of planted instances across all graphs. each entry:
-          { 'source_idx': i, 'motif_id': mid, 'nodes': [...] }
-        """
-        instances = []
-        for src_idx, res in enumerate(results):
-            pyg = res['pyg']
-            if not hasattr(pyg, 'motif_id'):
-                continue
-            motif_ids = pyg.motif_id.tolist()
-            groups = defaultdict(set)
-            for node_idx, mid in enumerate(motif_ids):
-                if mid > 0:
-                    groups[mid].add(node_idx)
-            for mid, nodes in groups.items():
-                instances.append({
-                    'source_idx': src_idx,
-                    'motif_id': mid,
-                    'nodes': sorted(nodes),
-                })
-        return instances
-
-    def _planted_motif_nodes(self, results):
-        """
-        return one set per source graph of all nodes flagged is_motif=1.
-        if is_motif is missing, fall back to motif_id > 0.
-        """
-        per_graph = []
-        for res in results:
-            pyg = res['pyg']
-            if hasattr(pyg, 'is_motif') and pyg.is_motif is not None:
-                flags = pyg.is_motif.tolist()
-            elif hasattr(pyg, 'motif_id') and pyg.motif_id is not None:
-                flags = [1 if m > 0 else 0 for m in pyg.motif_id.tolist()]
-            else:
-                flags = []
-            per_graph.append({i for i, f in enumerate(flags) if f})
-        return per_graph
 
     @staticmethod
     def _jaccard(a, b):
@@ -379,72 +346,94 @@ class DiscHashDecoder(Decoder):
         union = len(a | b)
         return inter / union if union else 0.0
 
-    def evaluate(self, results, patterns_ranked, instance_jaccard_threshold=0.5):
+    def evaluate(self, results, patterns_ranked):
         """
-        compute evaluation metrics against planted ground truth. returns a dict
-        with pattern-level, node-level, and instance-level metrics. returns an
-        empty dict if no ground truth is present.
+        type-level evaluation against embedded ground truth.
+        permutation-aligned per-node jaccard between
+        predicted clusters and motif type labels. additionally
+        reports g6 pattern precision/recall: did the predicted top patterns
+        cover the canonical topologies of the embedded motif types.
+        returns an empty dict if no ground truth is present.
         """
         if not self._has_ground_truth(results):
             return {}
 
-        planted_g6s = self._planted_g6s(results)
+        embedded_g6s = self._embedded_g6s(results)
         predicted_g6s = {p['label'] for p in patterns_ranked}
 
-        # pattern-level
-        if predicted_g6s and planted_g6s:
-            hit_labels = predicted_g6s & planted_g6s
+        if predicted_g6s and embedded_g6s:
+            hit_labels = predicted_g6s & embedded_g6s
             precision = len(hit_labels) / len(predicted_g6s)
-            recall = len(hit_labels) / len(planted_g6s)
+            recall = len(hit_labels) / len(embedded_g6s)
         else:
             hit_labels = set()
             precision = 0.0
             recall = 0.0
 
-        # node-level jaccard: predicted motif nodes vs planted motif nodes,
-        # computed per graph and averaged
-        planted_per_graph = self._planted_motif_nodes(results)
-        predicted_per_graph = [set() for _ in results]
-        for pat in patterns_ranked:
-            for inst in pat['instances']:
-                predicted_per_graph[inst['source_idx']].update(inst['nodes'])
-
-        jaccs = [self._jaccard(p, t)
-                 for p, t in zip(predicted_per_graph, planted_per_graph)
-                 if p or t]
-        node_jaccard = sum(jaccs) / len(jaccs) if jaccs else 0.0
-
-        # instance-level: fraction of planted instances matched by any
-        # predicted instance above the jaccard threshold
-        planted_instances = self._planted_instances(results)
-        pred_instances_per_graph = defaultdict(list)
-        for pat in patterns_ranked:
-            for inst in pat['instances']:
-                pred_instances_per_graph[inst['source_idx']].append(set(inst['nodes']))
-
-        matched = 0
-        for p_inst in planted_instances:
-            candidates = pred_instances_per_graph.get(p_inst['source_idx'], [])
-            planted_set = set(p_inst['nodes'])
-            best = max((self._jaccard(planted_set, c) for c in candidates),
-                       default=0.0)
-            if best >= instance_jaccard_threshold:
-                matched += 1
-        instance_recall = (matched / len(planted_instances)
-                           if planted_instances else 0.0)
+        # original paper-style permutation-aligned per-node jaccard
+        perm_jaccard = self._permutation_jaccard(results, patterns_ranked)
 
         return {
-            'planted_g6s': sorted(planted_g6s),
+            'embedded_g6s': sorted(embedded_g6s),
             'predicted_g6s': sorted(predicted_g6s),
             'hit_labels': sorted(hit_labels),
             'pattern_precision': precision,
             'pattern_recall': recall,
-            'node_jaccard': node_jaccard,
-            'instance_recall': instance_recall,
-            'num_planted_instances': len(planted_instances),
-            'num_matched_instances': matched,
-            'instance_jaccard_threshold': instance_jaccard_threshold,
+            'jaccard': perm_jaccard,
         }
+
+    def _permutation_jaccard(self, results, patterns_ranked):
+        """
+        original paper-style type-level jaccard.
+        treats each predicted pattern rank as a cluster id and each motif_id
+        as a true label. tries all permutations of predicted -> true
+        assignments and returns the best mean jaccard.
+        """
+        if not patterns_ranked:
+            return 0.0
+
+        best_total = 0.0
+        graphs_with_truth = 0
+
+        for src_idx, res in enumerate(results):
+            pyg = res['pyg']
+            if not hasattr(pyg, 'motif_id') or pyg.motif_id is None:
+                continue
+
+            motif_ids = pyg.motif_id.tolist()
+            n_nodes = len(motif_ids)
+
+            pred_assign = [-1] * n_nodes
+            for p_idx, pat in enumerate(patterns_ranked):
+                for inst in pat['instances']:
+                    if inst['source_idx'] != src_idx:
+                        continue
+                    for node in inst['nodes']:
+                        if pred_assign[node] == -1:
+                            pred_assign[node] = p_idx
+
+            true_labels = sorted({m for m in motif_ids if m > 0})
+            pred_labels = sorted({p for p in pred_assign if p >= 0})
+            if not true_labels or not pred_labels:
+                continue
+
+            graphs_with_truth += 1
+
+            best_jacc = 0.0
+            k = min(len(pred_labels), len(true_labels))
+            for perm in permutations(pred_labels, k):
+                mapping = dict(zip(perm, true_labels[:k]))
+                total = 0.0
+                for p_lab, t_lab in mapping.items():
+                    pred_nodes = {i for i, p in enumerate(pred_assign) if p == p_lab}
+                    true_nodes = {i for i, m in enumerate(motif_ids) if m == t_lab}
+                    total += self._jaccard(pred_nodes, true_nodes)
+                avg = total / len(mapping)
+                if avg > best_jacc:
+                    best_jacc = avg
+            best_total += best_jacc
+
+        return best_total / graphs_with_truth if graphs_with_truth else 0.0
 
     # ------------------------------------------------------------------
     # exports
@@ -495,14 +484,14 @@ class DiscHashDecoder(Decoder):
     def print_stats(self, patterns_ranked, eval_metrics=None):
         """
         print a summary table of the top patterns to stdout. when
-        eval_metrics is provided, an is_planted column is appended.
+        eval_metrics is provided, an is_embedded column is appended.
         """
-        planted_g6s = set(eval_metrics.get('planted_g6s', [])) if eval_metrics else set()
+        embedded_g6s = set(eval_metrics.get('embedded_g6s', [])) if eval_metrics else set()
 
         header = f"{'rank':<5} {'g6_label':<10} {'nodes':<6} {'edges':<6} " \
                  f"{'count':<6} {'total_score':<12} {'mean_score':<10}"
         if eval_metrics:
-            header += " planted"
+            header += " embedded"
         print(header)
         print("-" * len(header))
 
@@ -510,7 +499,7 @@ class DiscHashDecoder(Decoder):
             row = f"{rank:<5} {pat['label']:<10} {pat['nodes']:<6} {pat['edges']:<6} " \
                   f"{pat['count']:<6} {pat['total_score']:<12.3f} {pat['mean_score']:<10.3f}"
             if eval_metrics:
-                row += "  yes" if pat['label'] in planted_g6s else "  no"
+                row += "  yes" if pat['label'] in embedded_g6s else "  no"
             print(row)
 
     def export_eval(self, eval_metrics, out_path):
@@ -532,8 +521,7 @@ class DiscHashDecoder(Decoder):
                    max_size=8,
                    require_connected=True,
                    min_instances=2,
-                   rank_by='total_score',
-                   instance_jaccard_threshold=0.5):
+                   rank_by='total_score'):
         """
         one-shot entry point. produces inside `out_dir`:
             motifiesta_collection.txt  - nemo-style instance manifest
@@ -551,8 +539,7 @@ class DiscHashDecoder(Decoder):
                                          min_instances=min_instances)
         ranked = self.rank_patterns(patterns, top_n=top_n, by=rank_by)
 
-        eval_metrics = self.evaluate(results, ranked,
-                                     instance_jaccard_threshold=instance_jaccard_threshold)
+        eval_metrics = self.evaluate(results, ranked)
 
         collection_path = self.export_nemocollection(
             ranked, os.path.join(out_dir, 'motifiesta_collection.txt'))
@@ -595,17 +582,16 @@ if __name__ == "__main__":
         print("\neval:")
         print(f"  pattern precision: {ev['pattern_precision']:.3f}")
         print(f"  pattern recall:    {ev['pattern_recall']:.3f}")
-        print(f"  node jaccard:      {ev['node_jaccard']:.3f}")
-        print(f"  instance recall:   {ev['instance_recall']:.3f}")
-        print(f"  planted g6s:       {ev['planted_g6s']}")
+        print(f"  jaccard:           {ev['jaccard']:.3f}")
+        print(f"  embedded g6s:       {ev['embedded_g6s']}")
         print(f"  predicted g6s:     {ev['predicted_g6s']}")
         print(f"  hit labels:        {ev['hit_labels']}")
 
     print("\ntop motifs:")
     for rank, pat in enumerate(out['patterns'], start=1):
-        planted_flag = ""
+        embedded_flag = ""
         if out['eval']:
-            planted_flag = " [planted]" if pat['label'] in out['eval']['planted_g6s'] else ""
+            embedded_flag = " [embedded]" if pat['label'] in out['eval']['embedded_g6s'] else ""
         print(f"  {rank}. {pat['label']} ({pat['nodes']}n, {pat['edges']}e) "
               f"count={pat['count']} total_score={pat['total_score']:.3f}"
-              f"{planted_flag}")
+              f"{embedded_flag}")
