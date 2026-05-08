@@ -4,10 +4,12 @@ mirrors systxtdataset's shape/interface (one large graph, igraph sidecar,
 onehotdegree features) but embeds known motif instances so the decoder's
 evaluate() path can score discovery accuracy.
 
-api mirrors synthetic.generate_instances: one motif type at one size per
-dataset, count controlled by n_motifs. the motif_menu dict here is copied
-verbatim from generate_instances so geometry is identical between the two
-pipelines.
+api mirrors synthetic.generate_instances. motif_type accepts either a
+single string (single-type planting, all instances share motif_id=1) or
+a list of strings (multi-type planting, instances of motif_types[k] get
+motif_id k+1). n_motifs is per-type: total instances planted equals
+n_motifs * len(motif_type). the motif_menu dict here is copied verbatim
+from generate_instances so geometry is identical between the two pipelines.
 """
 import random
 
@@ -23,28 +25,33 @@ from MotiFiesta.utils.synthetic import motif_embed, generate_parent_erdos
 
 
 class SysSyntheticDataset(Dataset):
-    """single-graph synthetic dataset with embedded motifs of one type.
+    """single-graph synthetic dataset with embedded motifs.
 
     args:
         root: pyg dataset root. must contain 'sys_synth' so that
               loading.get_loader dispatches correctly.
-        motif_type: which motif from the menu — one of 'star', 'barbell',
-              'wheel', 'random', 'clique', 'lollipop'. Same names as
-              synthetic.generate_instances.
+        motif_type: which motif(s) from the menu. either a single name
+              or a list of names. valid names: 'star', 'barbell', 'wheel',
+              'random', 'clique', 'lollipop'. when a list is passed,
+              instances of each type get distinct motif_id values
+              (1, 2, ..., K) so the decoder can run K-class M-Jaccard.
+              same names as synthetic.generate_instances.
         motif_size: size knob, interpreted by the menu (matches
               generate_instances exactly: 'star' has motif_size+1 nodes,
               'barbell' uses motif_size//2 for each bell, etc).
-        n_motifs: number of instances of this motif to embed.
+        n_motifs: number of instances per motif type. with K types, total
+              instances planted = n_motifs * K.
         parent_size: number of nodes in the Erdős-Rényi parent (before
               motifs are grafted in; final graph is larger).
         parent_e_prob: edge probability for the parent er generation and the
               motif<->parent linking step.
-        random_e_prob: edge probability used internally when motif_type='random'.
-              defaults to none, meaning "fall back to parent_e_prob". For
-              single-graph mode the parent is large and parent_e_prob must be
-              tiny (~0.001) to keep the backbone sparse — that same value
-              would produce empty random motifs. override this to ~0.3-0.5
-              when motif_type='random'. Ignored for non-random motif types.
+        random_e_prob: edge probability used internally when 'random' is
+              among the motif types. defaults to none, meaning "fall back
+              to parent_e_prob". For single-graph mode the parent is large
+              and parent_e_prob must be tiny (~0.001) to keep the backbone
+              sparse — that same value would produce empty random motifs.
+              override this to ~0.3-0.5 when 'random' is in motif_type.
+              ignored otherwise.
         distort_p: per-edge perturbation probability applied to each motif
               instance at embed time. 0.0 = exact topology, >0 = noisier.
         seed: RNG seed for deterministic generation.
@@ -66,7 +73,12 @@ class SysSyntheticDataset(Dataset):
                  n_features=None,
                  transform=None,
                  pre_transform=None):
-        self.motif_type = str(motif_type)
+        # normalize motif_type to a list; preserve original input for repr
+        if isinstance(motif_type, str):
+            self.motif_types = [motif_type]
+        else:
+            self.motif_types = list(motif_type)
+        self.motif_type = motif_type
         self.motif_size = int(motif_size)
         self.n_motifs = int(n_motifs)
         self.parent_size = int(parent_size)
@@ -141,26 +153,37 @@ class SysSyntheticDataset(Dataset):
         np.random.seed(self.seed)
 
         menu = self._build_motif_menu()
-        if self.motif_type not in menu:
-            raise ValueError(
-                f"unknown motif_type {self.motif_type!r}; "
-                f"valid: {sorted(menu.keys())}"
-            )
-        template = menu[self.motif_type]()
+        for mt in self.motif_types:
+            if mt not in menu:
+                raise ValueError(
+                    f"unknown motif_type {mt!r}; "
+                    f"valid: {sorted(menu.keys())}"
+                )
 
         if self.n_motifs <= 0:
             raise ValueError(f"n_motifs must be > 0, got {self.n_motifs}")
-        if self.n_motifs >= self.parent_size:
+        total_instances = self.n_motifs * len(self.motif_types)
+        if total_instances >= self.parent_size:
             raise ValueError(
-                f"parent_size ({self.parent_size}) must exceed n_motifs "
-                f"({self.n_motifs}) to leave room for anchor nodes"
+                f"parent_size ({self.parent_size}) must exceed total instances "
+                f"({total_instances} = n_motifs {self.n_motifs} * "
+                f"types {len(self.motif_types)}) to leave room for anchor nodes"
             )
 
         # build the {dict_key: nx.graph} for motif_embed. dict keys must be
-        # unique for motif_embed's loop, but the resulting motif_id values
-        # get collapsed to 1 below so motif_id encodes type (matches the
-        # original synthetic.py: one type per dataset, all instances share id).
-        motifs_to_embed = {i: template.copy() for i in range(1, self.n_motifs + 1)}
+        # unique, but per-instance motif_ids are remapped to type ids below
+        # (instances of motif_types[k] -> motif_id k+1) so motif_id encodes
+        # type, matching the original synthetic.py convention.
+        templates = {mt: menu[mt]() for mt in self.motif_types}
+        motifs_to_embed = {}
+        key_to_type_id = {}
+        next_key = 1
+        for type_idx, mt in enumerate(self.motif_types, start=1):
+            template = templates[mt]
+            for _ in range(self.n_motifs):
+                motifs_to_embed[next_key] = template.copy()
+                key_to_type_id[next_key] = type_idx
+                next_key += 1
 
         # motif_distort (called inside motif_embed) reads node['class']
         for m in motifs_to_embed.values():
@@ -179,10 +202,11 @@ class SysSyntheticDataset(Dataset):
             n_classes=2,
         )
 
-        # collapse per-instance ids to the single type id (1)
+        # remap raw per-instance motif_ids to type ids in [1..K]
         for n in embedded.nodes():
-            if embedded.nodes[n].get('motif_id', 0) > 0:
-                embedded.nodes[n]['motif_id'] = 1
+            raw_mid = embedded.nodes[n].get('motif_id', 0)
+            if raw_mid > 0:
+                embedded.nodes[n]['motif_id'] = key_to_type_id[raw_mid]
 
         # strip node attrs so pyg doesn't pick up as separate tensors.
         # leaves `is_motif` and `motif_id` as the only per-node attrs.
@@ -205,13 +229,14 @@ class SysSyntheticDataset(Dataset):
         data.is_motif = data.is_motif.long()
 
         # sanity checks
-        assert data.motif_id.max().item() == 1, (
-            f"motif_id max should be 1 (one type), got "
+        n_types = len(self.motif_types)
+        assert data.motif_id.max().item() == n_types, (
+            f"motif_id max should be {n_types} (one per type), got "
             f"{data.motif_id.max().item()}"
         )
         assert data.is_motif.sum().item() > 0, "no motif nodes tagged"
 
-        data.num_embedded_instances = torch.tensor(self.n_motifs, dtype=torch.long)
+        data.num_embedded_instances = torch.tensor(total_instances, dtype=torch.long)
 
         torch.save(data, self.processed_paths[0])
 
@@ -232,9 +257,10 @@ class SysSyntheticDataset(Dataset):
 
 if __name__ == "__main__":
     # base run, after any change to this file:
-    #   rm -rf data/sys_synth_toy/processed
+    #   rm -rf data/sys_synth/processed data/sys_synth_toy_multi/processed
+    print("=== single-type ===")
     ds = SysSyntheticDataset(
-        root="data/sys_synth_toy",
+        root="data/sys_synth",
         motif_type='clique',
         motif_size=4,
         n_motifs=5,
@@ -258,5 +284,28 @@ if __name__ == "__main__":
     mid_counts = Counter(d.motif_id.tolist())
     print("per-motif_id node counts:")
     for mid in sorted(mid_counts):
-        tag = "background" if mid == 0 else f"instance {mid}"
+        tag = "background" if mid == 0 else f"type {mid}"
         print(f"  {tag:>15s}: {mid_counts[mid]}")
+
+    print("\n=== multi-type ===")
+    ds = SysSyntheticDataset(
+        root="data/sys_synth_multi",
+        motif_type=['clique', 'star', 'barbell'],
+        motif_size=5,
+        n_motifs=4,
+        parent_size=120,
+        parent_e_prob=0.05,
+        distort_p=0.0,
+        seed=0,
+    )
+    d = ds[0]
+    print(f"motif_type      : {ds.motif_type}")
+    print(f"num_nodes       : {d.num_nodes}")
+    print(f"motif_id range  : [{d.motif_id.min().item()}, {d.motif_id.max().item()}]")
+    print(f"is_motif sum    : {d.is_motif.sum().item()}")
+    print(f"embedded count   : {d.num_embedded_instances.item()}")
+    mid_counts = Counter(d.motif_id.tolist())
+    print("per-motif_id node counts:")
+    for mid in sorted(mid_counts):
+        tag = "background" if mid == 0 else f"type {mid} ({ds.motif_types[mid-1]})"
+        print(f"  {tag:>25s}: {mid_counts[mid]}")
