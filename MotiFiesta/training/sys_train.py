@@ -84,7 +84,6 @@ def _make_neg(pos, n_iter=100):
     produce a rewired null from a positive batch via classical double edge swap.
     preserves the degree sequence.
     """
-    # rewire operates on a cpu pyg Data; push back to the original device
     device = pos.x.device
     neg = rewire(pos.cpu(), n_iter=n_iter)
     return neg.to(device)
@@ -108,7 +107,9 @@ def sys_train(model,
                 hard_embed=False,
                 epoch_start=0,
                 optimizer=None,
-                controller_state=None
+                controller_state=None,
+                rec_kernel='wwl',
+                edge_sample_rate=1.0,
                 ):
     """sys_train.
 
@@ -123,6 +124,8 @@ def sys_train(model,
     :param lam: loss coefficient for edge scores
     :param beta: bandwidth for freq loss exponential
     :param max_batches: if not -1, stop after given number of batches
+    :param rec_kernel: 'wwl' (original) or 'wl' (vectorized wl subtree kernel)
+    :param edge_sample_rate: fraction of (i,j) entries used for rec supervision
     """
     start_time = time.time()
     device = get_device()
@@ -175,13 +178,22 @@ def sys_train(model,
             warmup_done = False
 
             if controller.keep_going('rec') and not hard_embed:
-                rec_loss = model.rec_loss(xx_pos,
-                                          ee_pos,
-                                          merge_info_pos['spotlights'],
-                                          source_graph,
-                                          internals_pos,
-                                          draw=False
-                                          )
+                if rec_kernel == 'wl':
+                    rec_loss = model.rec_loss_wl(xx_pos,
+                                                 ee_pos,
+                                                 merge_info_pos['spotlights'],
+                                                 source_graph,
+                                                 internals_pos,
+                                                 edge_sample_rate=edge_sample_rate,
+                                                 )
+                else:
+                    rec_loss = model.rec_loss(xx_pos,
+                                              ee_pos,
+                                              merge_info_pos['spotlights'],
+                                              source_graph,
+                                              internals_pos,
+                                              draw=False
+                                              )
                 rec_loss_tot += rec_loss.item()
                 backward = True
                 loss += rec_loss
@@ -253,12 +265,21 @@ def sys_train(model,
             sil_loss = torch.tensor(float('nan'))
 
             if controller.keep_going('rec'):
-                rec_loss = model.rec_loss(xx_pos,
-                                        ee_pos,
-                                        merge_info_pos['spotlights'],
-                                        source_graph,
-                                        internals_pos
-                                        )
+                if rec_kernel == 'wl':
+                    rec_loss = model.rec_loss_wl(xx_pos,
+                                                 ee_pos,
+                                                 merge_info_pos['spotlights'],
+                                                 source_graph,
+                                                 internals_pos,
+                                                 edge_sample_rate=edge_sample_rate,
+                                                 )
+                else:
+                    rec_loss = model.rec_loss(xx_pos,
+                                            ee_pos,
+                                            merge_info_pos['spotlights'],
+                                            source_graph,
+                                            internals_pos
+                                            )
             else:
                 warmup_done = True
 

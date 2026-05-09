@@ -183,6 +183,97 @@ class MotiFiestaModel(torch.nn.Module):
             loss += l
 
         return loss / self.steps
+    
+    def rec_loss_wl(self,
+                    xx,
+                    ee,
+                    spotlights,
+                    source_graph,
+                    internals,
+                    num_nodes=20,
+                    edge_sample_rate=1.0,
+                    wl_iter=3,
+                    ):
+        """reconstruction loss using wl subtree kernel, vectorized.
+
+        builds K_true via the batched wl subtree kernel: all spotlights
+        at one pooling level are stacked into a single disjoint-union
+        graph, wl labeling runs once on the union, and the full N x N
+        similarity matrix is produced via histogram @ histogram.T per
+        iteration.
+
+        edge_sample_rate < 1.0 zeros a random subset of (i, j) entries
+        in both K_predict and K_true so the loss only supervises a
+        fraction of the pairs per batch.
+        """
+        from MotiFiesta.training.wl_kernel import (
+            wl_subtree_similarity_batch,
+            initial_labels_from_onehot,
+        )
+        from torch_geometric.utils import subgraph as pyg_subgraph
+
+        device = get_device()
+
+        source_edge_index = source_graph.cached_data.edge_index.to(device)
+        source_x = source_graph.cached_data.x.to(device)
+        source_labels = initial_labels_from_onehot(source_x)
+        n_source = source_x.size(0)
+
+        loss = 0
+        for level in range(len(xx)):
+            x = internals[level]['x_merged']
+            n_take = min(num_nodes, x.size(0))
+            if n_take < 2:
+                continue
+
+            target_spotlights = spotlights.get(level + 1, spotlights.get(level, {}))
+
+            edge_indices = []
+            node_counts = []
+            init_labels = []
+            valid_local = []
+            for spot_idx in range(n_take):
+                spot_global_ids = target_spotlights.get(spot_idx)
+                if not spot_global_ids:
+                    continue
+                node_idx = torch.tensor(
+                    sorted(spot_global_ids), dtype=torch.long, device=device
+                )
+                ei_sub, _ = pyg_subgraph(
+                    node_idx,
+                    source_edge_index,
+                    relabel_nodes=True,
+                    num_nodes=n_source,
+                )
+                edge_indices.append(ei_sub)
+                node_counts.append(node_idx.size(0))
+                init_labels.append(source_labels[node_idx])
+                valid_local.append(spot_idx)
+
+            if len(valid_local) < 2:
+                continue
+
+            K_valid = wl_subtree_similarity_batch(
+                edge_indices, node_counts, init_labels, n_iter=wl_iter,
+            )
+
+            K_true = torch.zeros(n_take, n_take, device=device)
+            valid_idx = torch.tensor(valid_local, dtype=torch.long, device=device)
+            K_true[valid_idx.unsqueeze(1), valid_idx.unsqueeze(0)] = K_valid
+
+            K_predict = matrix_cosine(x[:n_take], x[:n_take]).to(device)
+
+            if edge_sample_rate < 1.0:
+                mask = torch.rand(n_take, n_take, device=device) < edge_sample_rate
+                mask = mask | mask.t()
+                mask.fill_diagonal_(True)
+                K_predict = K_predict * mask.float()
+                K_true = K_true * mask.float()
+
+            l = torch.nn.MSELoss()(K_predict, K_true)
+            loss += l
+
+        return loss / self.steps
 
     @staticmethod
     def kde(X, X_ref, h=1):
