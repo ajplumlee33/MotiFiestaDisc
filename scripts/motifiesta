@@ -50,6 +50,8 @@ if function == 'train':
     parser.add_argument("--estimator", "-es", type=str, default='knn', help="Which density estimator to use for the motif agg. step")
     parser.add_argument("--n-neighbors", "-nn", type=int, default=30, help="Number of neighbors")
     parser.add_argument("--volume", "-vv", action='store_true', default=False, help="Use d-sphere volume to normalize density with kNN.")
+    parser.add_argument('--rec-kernel', choices=['wwl', 'wl'], default='wl')
+    parser.add_argument('--edge-sample-rate', type=float, default=1.0)
     parser.add_argument("--sil-momentum", type=float, default=0.95,
                         help="EMA momentum for the sampling invariance tracker (higher = more stable targets)")
 
@@ -188,6 +190,8 @@ if function == 'train':
                     test_loader=data['loader_test'],
                     source_graph=data['dataset_whole'],
                     mode=args.mode,
+                    rec_kernel=args.rec_kernel,
+                    edge_sample_rate=args.edge_sample_rate,
                     sil_momentum=args.sil_momentum,
                     model_name=args.name,
                     epochs=args.epochs,

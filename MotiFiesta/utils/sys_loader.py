@@ -8,7 +8,7 @@ class SysLoader:
     null (rewired) samples are generated downstream in sys_train when the motif
     phase kicks in, so the loader pays no cost during warmup.
     """
-    def __init__(self, data, batch_size=128, input_nodes=None, num_neighbors=[20, 10], **kwargs):
+    def __init__(self, data, batch_size=128, input_nodes=None, num_neighbors=[10, 5], **kwargs):
         self.loader = NeighborLoader(
             data,
             num_neighbors=num_neighbors,
