@@ -246,6 +246,79 @@ def batch_to_node_indices(batch):
     assert len(indices) == len(batch)
     return indices
 
+
+# ---------------------------------------------------------------------------
+# tensor-based spotlight tracking
+# ---------------------------------------------------------------------------
+# spotlight_assignment[t]: long tensor (n_batch_nodes,) where entry i is the
+# supernode index at level t that original local node i belongs to.
+# cluster_chain[t]: long tensor (n_supernodes_at_t,), maps level-t supernode
+# index to level-(t+1) supernode index.
+# n_id: long tensor (n_batch_nodes,) of global node ids.
+
+
+def spotlight_at(spotlight_assignment, n_id, t, supernode_idx):
+    """global node ids in the spotlight of supernode `supernode_idx` at level t."""
+    mask = spotlight_assignment[t] == supernode_idx
+    local_members = mask.nonzero(as_tuple=False).squeeze(-1)
+    return n_id[local_members]
+
+
+def edge_spotlight(spotlight_assignment, n_id, t, u_idx, v_idx):
+    """global node ids in the union of u's and v's spotlights at level t."""
+    spot_t = spotlight_assignment[t]
+    mask = (spot_t == u_idx) | (spot_t == v_idx)
+    local_members = mask.nonzero(as_tuple=False).squeeze(-1)
+    return n_id[local_members]
+
+
+def children_at(cluster_chain, t, supernode_idx):
+    """level-(t-1) supernode indices that merged into `supernode_idx` at level t."""
+    if t < 1:
+        return torch.empty(0, dtype=torch.long)
+    cluster = cluster_chain[t - 1]
+    mask = cluster == supernode_idx
+    return mask.nonzero(as_tuple=False).squeeze(-1)
+
+
+def spotlight_key(global_ids):
+    """hashable key (sorted tuple of ints) for tracker lookups."""
+    if isinstance(global_ids, torch.Tensor):
+        return tuple(sorted(global_ids.tolist()))
+    return tuple(sorted(global_ids))
+
+
+def get_edge_subgraphs_tensor(edge_index, spotlight_assignment, n_id, level,
+                              source_graph, source_x):
+    """edge spotlight subgraphs from the tensor representation.
+
+    for each edge (u, v) in edge_index, builds the induced subgraph of
+    source_graph over the union of u's and v's spotlights at level. returns
+    (list of igraph subgraphs, list of feature arrays).
+    """
+    subgraphs = []
+    X = []
+    spot_t = spotlight_assignment[level]
+    n_id_cpu = n_id.cpu()
+
+    for u, v in edge_index.T:
+        u_idx = u.item()
+        v_idx = v.item()
+        mask = (spot_t == u_idx) | (spot_t == v_idx)
+        local_members = mask.nonzero(as_tuple=False).squeeze(-1).cpu()
+        global_ids_sorted = sorted(n_id_cpu[local_members].tolist())
+
+        subgraph = source_graph.subgraph(global_ids_sorted)
+        node_features = np.stack([
+            source_x[g].cpu().numpy() for g in global_ids_sorted
+        ])
+
+        subgraphs.append(subgraph)
+        X.append(node_features)
+
+    return subgraphs, X
+
+
 if __name__ == "__main__":
     import doctest
     doctest.testmod()

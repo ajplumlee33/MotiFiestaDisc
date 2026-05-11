@@ -67,29 +67,34 @@ class DiscHashDecoder(Decoder):
     # ------------------------------------------------------------------
 
     @staticmethod
-    def total_sigma(level, node, tree, sigmas, ee):
-        """ recursively sum edge scores along the contraction path. """
+    def total_sigma(level, node, cluster_chain, sigmas, ee):
+        """recursively sum edge scores along the contraction path.
+
+        children of `node` at `level` are the level-(level-1) supernodes
+        whose entry in cluster_chain[level-1] equals `node`.
+        """
         if level == 0:
             return 0
 
-        children = list(tree[level][node])
+        cluster = cluster_chain[level - 1]
+        children = (cluster == node).nonzero(as_tuple=False).squeeze(-1).tolist()
 
         if len(children) < 2:
-            return DiscHashDecoder.total_sigma(level - 1, children[0], tree, sigmas, ee)
+            return DiscHashDecoder.total_sigma(level - 1, children[0], cluster_chain, sigmas, ee)
 
         c0, c1 = children[0], children[1]
         edge_lookups = ee
         e_idx = edge_lookups[level-1].get(tuple(sorted((c0, c1))))
 
         if e_idx is None:
-            return DiscHashDecoder.total_sigma(level-1, c0, tree, sigmas, ee) +\
-                   DiscHashDecoder.total_sigma(level-1, c1, tree, sigmas, ee)
+            return DiscHashDecoder.total_sigma(level-1, c0, cluster_chain, sigmas, ee) +\
+                   DiscHashDecoder.total_sigma(level-1, c1, cluster_chain, sigmas, ee)
 
         current_score = sigmas[level-1][e_idx]
 
         return current_score +\
-               DiscHashDecoder.total_sigma(level-1, c0, tree, sigmas, ee) +\
-               DiscHashDecoder.total_sigma(level-1, c1, tree, sigmas, ee)
+               DiscHashDecoder.total_sigma(level-1, c0, cluster_chain, sigmas, ee) +\
+               DiscHashDecoder.total_sigma(level-1, c1, cluster_chain, sigmas, ee)
 
     def _induced_subgraph(self, source_nx, spotlight):
         """
@@ -176,14 +181,26 @@ class DiscHashDecoder(Decoder):
 
             source_nx = to_networkx(g, to_undirected=True)
 
+            # pull the new tensor-based merge_info fields
+            spot_assign = merge_info['spotlight_assignment']
+            cluster_chain = merge_info['cluster_chain']
+            n_id = merge_info['n_id']
+
             spotlights = []
             scores = []
             hashes = []
 
+            spot_at_level = spot_assign[self.level]
+
             for i, x in enumerate(embs[self.level]):
                 h = hash_table.index(x.detach().numpy())[0]
-                spot = set(merge_info['spotlights'][self.level][i])
-                score = self.total_sigma(self.level, i, merge_info['tree'],
+
+                # global node ids in the spotlight of supernode i at self.level
+                mask = spot_at_level == i
+                local_members = mask.nonzero(as_tuple=False).squeeze(-1)
+                spot = set(n_id[local_members].tolist())
+
+                score = self.total_sigma(self.level, i, cluster_chain,
                                          probas, ee_lookups)
 
                 spotlights.append(spot)

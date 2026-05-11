@@ -181,7 +181,7 @@ def sys_train(model,
                 if rec_kernel == 'wl':
                     rec_loss = model.rec_loss_wl(xx_pos,
                                                  ee_pos,
-                                                 merge_info_pos['spotlights'],
+                                                 merge_info_pos,
                                                  source_graph,
                                                  internals_pos,
                                                  edge_sample_rate=edge_sample_rate,
@@ -189,7 +189,7 @@ def sys_train(model,
                 else:
                     rec_loss = model.rec_loss(xx_pos,
                                               ee_pos,
-                                              merge_info_pos['spotlights'],
+                                              merge_info_pos,
                                               source_graph,
                                               internals_pos,
                                               draw=False
@@ -221,7 +221,7 @@ def sys_train(model,
 
                 if mode in ('sil', 'combined') and controller.keep_going('sil'):
                     sil_loss = model.sil_loss(internals_pos,
-                                              merge_info_pos['spotlights'],
+                                              merge_info_pos,
                                               sil_tracker,
                                               momentum=sil_momentum)
                     loss += sil_loss * lam
@@ -268,7 +268,7 @@ def sys_train(model,
                 if rec_kernel == 'wl':
                     rec_loss = model.rec_loss_wl(xx_pos,
                                                  ee_pos,
-                                                 merge_info_pos['spotlights'],
+                                                 merge_info_pos,
                                                  source_graph,
                                                  internals_pos,
                                                  edge_sample_rate=edge_sample_rate,
@@ -276,7 +276,7 @@ def sys_train(model,
                 else:
                     rec_loss = model.rec_loss(xx_pos,
                                             ee_pos,
-                                            merge_info_pos['spotlights'],
+                                            merge_info_pos,
                                             source_graph,
                                             internals_pos
                                             )
@@ -302,7 +302,7 @@ def sys_train(model,
 
                 if mode in ('sil', 'combined'):
                     sil_loss = model.sil_loss(internals_pos,
-                                              merge_info_pos['spotlights'],
+                                              merge_info_pos,
                                               sil_tracker,
                                               momentum=sil_momentum)
 
