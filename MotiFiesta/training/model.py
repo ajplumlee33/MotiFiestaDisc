@@ -25,7 +25,12 @@ from MotiFiesta.training.edge_pool import EdgePooling
 from MotiFiesta.utils.subgraph_similarity import build_wwl_K
 
 from MotiFiesta.utils.learning_utils import get_device
-from MotiFiesta.utils.graph_utils import *
+from MotiFiesta.utils.graph_utils import (
+    spotlight_at,
+    edge_spotlight,
+    spotlight_key,
+    get_edge_subgraphs_tensor,
+)
 
 
 class MotiFiestaModel(torch.nn.Module):
@@ -79,22 +84,22 @@ class MotiFiestaModel(torch.nn.Module):
         :param edge_index: list of edges
         :param batch: batching tensor
         :param n_id: optional global node ids from neighborloader. when provided,
-            spotlights are initialised with these global ids so that subgraph lookups
+            spotlight_assignment is initialised so that subgraph lookups
             can be performed on the full graph instead of the sampled neighbourhood.
         """
         # fall back to local indices when no global mapping is given
         if n_id is None:
             n_id = torch.arange(len(x), device=x.device)
 
-        merge_tree = {}
-        spotlights = {}
-        nodes = list(range(len(x)))
-        merge_tree[0] = {n: set({}) for n in nodes}
-        # level 0 spotlights hold the global id for each local node
-        spotlights[0] = {n: {n_id[n].item()} for n in nodes}
+        n_batch_nodes = x.size(0)
 
-        edge_index_initial = edge_index
-        nodes_initial = nodes
+        # spotlight_assignment[t][i] = supernode at level t for original node i
+        # initial state: every node is its own supernode
+        spotlight_assignment = [
+            torch.arange(n_batch_nodes, device=x.device, dtype=torch.long)
+        ]
+        # cluster_chain[t] maps level-t supernode index to level-(t+1) index
+        cluster_chain = []
 
         xx, ee, pp = [], [], []
         batches = []
@@ -112,21 +117,27 @@ class MotiFiestaModel(torch.nn.Module):
             batches.append(batch)
             internals.append(out['internals'])
 
-            update_merge_graph(merge_tree, out['new_graph']['unpool'].cluster, t+1)
-            update_spotlights(spotlights, out['new_graph']['unpool'].cluster, t+1)
+            cluster = out['new_graph']['unpool'].cluster
+            cluster_chain.append(cluster)
+            # propagate spotlight membership through the cluster mapping
+            spotlight_assignment.append(cluster[spotlight_assignment[-1]])
 
             edge_index = out['new_graph']['e_ind_new']
             x = out['new_graph']['x_new']
             batch = out['new_graph']['batch_new']
 
-        merge_info = {'tree': merge_tree, 'spotlights': spotlights}
+        merge_info = {
+            'spotlight_assignment': spotlight_assignment,
+            'cluster_chain': cluster_chain,
+            'n_id': n_id,
+        }
 
         return xx, pp, ee, batches, merge_info, internals
 
     def rec_loss(self,
                  xx,
                  ee,
-                 spotlights,
+                 merge_info,
                  source_graph,
                  internals,
                  num_nodes=20,
@@ -142,18 +153,18 @@ class MotiFiestaModel(torch.nn.Module):
         source_ig = source_graph.ig_graph
         source_x = source_graph.cached_data.x
 
+        spot_assign = merge_info['spotlight_assignment']
+        n_id = merge_info['n_id']
+
         loss = 0
         for level in range(len(xx)):
             x = internals[level]['x_merged']
 
-            # extract spotlight subgraphs from the full graph using global ids
-            subgraphs, node_features = get_edge_subgraphs(ee[level],
-                                                          spotlights,
-                                                          level,
-                                                          source_ig,
-                                                          source_x,
-                                                          None,
-                                                          )
+            # extract spotlight subgraphs from the full graph using the tensor
+            # representation. one subgraph per edge in ee[level].
+            subgraphs, node_features = get_edge_subgraphs_tensor(
+                ee[level], spot_assign, n_id, level, source_ig, source_x,
+            )
 
             K_predict = matrix_cosine(x[:num_nodes], x[:num_nodes])
             K_predict = K_predict.to(get_device())
@@ -183,28 +194,28 @@ class MotiFiestaModel(torch.nn.Module):
             loss += l
 
         return loss / self.steps
-    
+
     def rec_loss_wl(self,
                     xx,
                     ee,
-                    spotlights,
+                    merge_info,
                     source_graph,
                     internals,
                     num_nodes=20,
                     edge_sample_rate=1.0,
                     wl_iter=3,
                     ):
-        """reconstruction loss using wl subtree kernel, vectorized.
+        """edge-level reconstruction loss using the wl subtree kernel.
 
-        builds K_true via the batched wl subtree kernel: all spotlights
-        at one pooling level are stacked into a single disjoint-union
-        graph, wl labeling runs once on the union, and the full N x N
-        similarity matrix is produced via histogram @ histogram.T per
-        iteration.
+        for each pooling level, iterates over edges in ee[level] and builds the
+        edge spotlight as the union of endpoint spotlights. K_predict comes
+        from the per-edge merged embeddings; K_true is the pairwise wl kernel
+        on the edge spotlight subgraphs. semantics match rec_loss; only the
+        graph kernel differs.
 
-        edge_sample_rate < 1.0 zeros a random subset of (i, j) entries
-        in both K_predict and K_true so the loss only supervises a
-        fraction of the pairs per batch.
+        edge_sample_rate < 1.0 zeros a random subset of (i, j) entries in
+        both K_predict and K_true so the loss only supervises a fraction of
+        the pairs per batch.
         """
         from MotiFiesta.training.wl_kernel import (
             wl_subtree_similarity_batch,
@@ -219,6 +230,9 @@ class MotiFiestaModel(torch.nn.Module):
         source_labels = initial_labels_from_onehot(source_x)
         n_source = source_x.size(0)
 
+        spot_assign = merge_info['spotlight_assignment']
+        n_id = merge_info['n_id']
+
         loss = 0
         for level in range(len(xx)):
             x = internals[level]['x_merged']
@@ -226,29 +240,36 @@ class MotiFiestaModel(torch.nn.Module):
             if n_take < 2:
                 continue
 
-            target_spotlights = spotlights.get(level + 1, spotlights.get(level, {}))
+            spot_t = spot_assign[level]
+            edge_idx_at_level = ee[level]
 
             edge_indices = []
             node_counts = []
             init_labels = []
             valid_local = []
-            for spot_idx in range(n_take):
-                spot_global_ids = target_spotlights.get(spot_idx)
-                if not spot_global_ids:
+
+            for k in range(n_take):
+                u_idx = edge_idx_at_level[0, k].item()
+                v_idx = edge_idx_at_level[1, k].item()
+
+                # union of endpoint spotlights at this level
+                mask = (spot_t == u_idx) | (spot_t == v_idx)
+                local_members = mask.nonzero(as_tuple=False).squeeze(-1)
+                if local_members.numel() == 0:
                     continue
-                node_idx = torch.tensor(
-                    sorted(spot_global_ids), dtype=torch.long, device=device
-                )
+
+                global_node_idx = n_id[local_members].sort().values
+
                 ei_sub, _ = pyg_subgraph(
-                    node_idx,
+                    global_node_idx,
                     source_edge_index,
                     relabel_nodes=True,
                     num_nodes=n_source,
                 )
                 edge_indices.append(ei_sub)
-                node_counts.append(node_idx.size(0))
-                init_labels.append(source_labels[node_idx])
-                valid_local.append(spot_idx)
+                node_counts.append(global_node_idx.size(0))
+                init_labels.append(source_labels[global_node_idx])
+                valid_local.append(k)
 
             if len(valid_local) < 2:
                 continue
@@ -370,22 +391,24 @@ class MotiFiestaModel(torch.nn.Module):
         tot_loss /= steps
         return tot_loss
 
-    def sil_loss(self, internals_pos, spotlights, tracker, momentum=0.95):
-        """
-        sampling invariance loss.
+    def sil_loss(self, internals_pos, merge_info, tracker, momentum=0.95):
+        """sampling invariance loss.
 
         neighborhood sampling exposes each node to varying local contexts across
         batches. a real motif instance should look the same regardless of which
         neighborhood it was sampled within. this loss tracks a momentum-updated
-        target embedding for every (source_node, level) pair and penalises
+        target embedding for every (spotlight, level) pair and penalises
         deviations of the current batch's embedding from the target.
 
         :param internals_pos: per-level internals returned by the forward pass
-        :param spotlights: merge_info['spotlights'] for the current batch
+        :param merge_info: dict with spotlight_assignment, cluster_chain, n_id
         :param tracker: SamplingInvarianceTracker storing the targets
         :param momentum: smoothing factor for the target update (0.95 default)
         """
         device = get_device()
+        spot_assign = merge_info['spotlight_assignment']
+        n_id = merge_info['n_id']
+
         tot_loss = torch.zeros(1, device=device)
         n_terms = 0
 
@@ -396,27 +419,33 @@ class MotiFiestaModel(torch.nn.Module):
 
             # normalize to compare direction rather than magnitude
             h_cur = F.normalize(x_level, dim=-1)
+            spot_t = spot_assign[level]
 
-            # each supernode at this level represents one spotlight; we anchor the
-            # target to the sorted spotlight tuple so it is stable across batches
-            for node_idx in range(x_level.size(0)):
-                spot = spotlights[level].get(node_idx)
-                if not spot:
+            # iterate over rows of x_level (one per edge at this level), and
+            # query the spotlight at the same index. supernode count at level
+            # may differ from x_level.size(0); indices beyond that produce
+            # empty spotlights and are skipped, matching the original behavior.
+            for k in range(x_level.size(0)):
+                mask = spot_t == k
+                local_members = mask.nonzero(as_tuple=False).squeeze(-1)
+                if local_members.numel() == 0:
                     continue
-                key = tuple(sorted(spot))
+
+                global_ids = n_id[local_members]
+                key = spotlight_key(global_ids)
 
                 target = tracker.get(key, level)
                 if target is None:
                     # first sighting: seed the target with the current embedding
-                    tracker.set(key, level, h_cur[node_idx].detach())
+                    tracker.set(key, level, h_cur[k].detach())
                     continue
 
                 target = target.to(device)
-                tot_loss = tot_loss + (1.0 - (h_cur[node_idx] * target).sum())
+                tot_loss = tot_loss + (1.0 - (h_cur[k] * target).sum())
                 n_terms += 1
 
                 # ema update of the target; detach to keep it out of the graph
-                new_target = momentum * target + (1.0 - momentum) * h_cur[node_idx].detach()
+                new_target = momentum * target + (1.0 - momentum) * h_cur[k].detach()
                 new_target = F.normalize(new_target, dim=-1)
                 tracker.set(key, level, new_target)
 

@@ -10,10 +10,13 @@ from MotiFiesta.training.disc_decode import DiscHashDecoder
 
 def main():
     decoder = DiscHashDecoder(
-        model_id='test',
-        dataset_id='mips_torch',
-        dataset_root='data/mips_torch',
-        level=2,
+        #model_id='test',
+        #dataset_id='mips_torch',
+        #dataset_root='data/mips_torch',
+        model_id='sys_synth-clique-com-d0.00',
+        dataset_id='sys_synth-clique-d0.00',
+        dataset_root='data/sys_synth-clique-d0.00',
+        level=3,
     )
 
     results = decoder.decode()
