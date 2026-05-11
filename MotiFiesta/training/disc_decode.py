@@ -20,7 +20,7 @@ class Decoder:
         print(self.model)
 
         root = dataset_root if dataset_root is not None else dataset_id
-        self.dataset = get_loader(root=root, name=dataset_id)
+        self.dataset = get_loader(root=root, name=dataset_id, max_degree=18)
         pass
 
     def decode(self):
@@ -326,33 +326,47 @@ class DiscHashDecoder(Decoder):
         return hasattr(pyg, 'motif_id') and pyg.motif_id is not None
 
     def _embedded_g6s(self, results):
-        """
-        return the set of canonical g6 labels of the embedded motif topologies.
-        groups nodes by motif_id (motif type), then splits each group into
-        connected components so multiple instances of the same type each
-        contribute their own topology label (which deduplicates in the set).
+        """canonical g6 labels of the embedded motif instances.
+
+        groups nodes by instance_id (each unique value is one planted motif
+        instance) and emits the g6 of each instance's induced subgraph.
+        falls back to motif_id + connected_components for datasets that don't
+        have instance_id (older processed files).
         """
         g6s = set()
         for res in results:
             pyg = res['pyg']
             source_nx = res['source_nx']
-            if not hasattr(pyg, 'motif_id'):
-                continue
-            motif_ids = pyg.motif_id.tolist()
-            groups = defaultdict(set)
-            for node_idx, mid in enumerate(motif_ids):
-                if mid > 0:
-                    groups[mid].add(node_idx)
-            for mid, nodes in groups.items():
-                sub_all = source_nx.subgraph(nodes)
-                # each connected component is one embedded instance
-                for component in nx.connected_components(sub_all):
-                    if len(component) < 2:
+
+            if hasattr(pyg, 'instance_id') and pyg.instance_id is not None:
+                instance_ids = pyg.instance_id.tolist()
+                groups = defaultdict(set)
+                for node_idx, iid in enumerate(instance_ids):
+                    if iid > 0:
+                        groups[iid].add(node_idx)
+                for iid, nodes in groups.items():
+                    if len(nodes) < 2:
                         continue
-                    sub, _ = self._induced_subgraph(source_nx, component)
+                    sub, _ = self._induced_subgraph(source_nx, nodes)
                     if sub.number_of_edges() == 0:
                         continue
                     g6s.add(self._graph6(sub))
+            elif hasattr(pyg, 'motif_id'):
+                # legacy fallback: connected components on motif_id-tagged nodes
+                motif_ids = pyg.motif_id.tolist()
+                groups = defaultdict(set)
+                for node_idx, mid in enumerate(motif_ids):
+                    if mid > 0:
+                        groups[mid].add(node_idx)
+                for mid, nodes in groups.items():
+                    sub_all = source_nx.subgraph(nodes)
+                    for component in nx.connected_components(sub_all):
+                        if len(component) < 2:
+                            continue
+                        sub, _ = self._induced_subgraph(source_nx, component)
+                        if sub.number_of_edges() == 0:
+                            continue
+                        g6s.add(self._graph6(sub))
         return g6s
 
     @staticmethod

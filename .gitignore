@@ -164,6 +164,7 @@ cython_debug/
 css595.ipynb
 #.gitignore
 /data/
+/decoded/
 data/mips_torch/data.pt
 data/mips.txt
 /models/

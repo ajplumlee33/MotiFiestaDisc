@@ -69,7 +69,7 @@ class SysSyntheticDataset(Dataset):
                  random_e_prob=None,
                  distort_p=0.0,
                  seed=0,
-                 max_degree=None,
+                 max_degree=18,
                  n_features=None,
                  transform=None,
                  pre_transform=None):
@@ -202,9 +202,11 @@ class SysSyntheticDataset(Dataset):
             n_classes=2,
         )
 
-        # remap raw per-instance motif_ids to type ids in [1..K]
+        # preserve per-instance id (unique per embedded motif) and remap
+        # the type-id motif_id used by the rest of the pipeline.
         for n in embedded.nodes():
             raw_mid = embedded.nodes[n].get('motif_id', 0)
+            embedded.nodes[n]['instance_id'] = raw_mid
             if raw_mid > 0:
                 embedded.nodes[n]['motif_id'] = key_to_type_id[raw_mid]
 
@@ -227,6 +229,7 @@ class SysSyntheticDataset(Dataset):
         # dtype hygiene — decoder expects long tensors for ground truth
         data.motif_id = data.motif_id.long()
         data.is_motif = data.is_motif.long()
+        data.instance_id = data.instance_id.long()
 
         # sanity checks
         n_types = len(self.motif_types)
