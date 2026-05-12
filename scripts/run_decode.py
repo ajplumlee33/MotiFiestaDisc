@@ -13,7 +13,7 @@ def main():
         #model_id='test',
         #dataset_id='mips_torch',
         #dataset_root='data/mips_torch',
-        model_id='sys_synth-clique-com-d0.05',
+        model_id='sys_synth-clique-com-opt2-d0.05',
         dataset_id='sys_synth-clique-d0.05',
         dataset_root='data/sys_synth-clique-d0.05',
         level=3,
@@ -27,7 +27,7 @@ def main():
     print("\n=== top motifs ===")
     out = decoder.export_all(
         results,
-        out_dir='decoded/sys_synth-clique-com-d0.05',
+        out_dir='decoded/sys_synth-clique-com-opt2-d0.05',
         top_n=10,
         min_size=3,
         max_size=8,

@@ -11,33 +11,22 @@ from torch_geometric.utils import to_undirected
 from torch_geometric.utils import from_networkx
 from torch_geometric.utils import to_networkx
 from torch_geometric.utils import degree
+from MotiFiesta.utils.graph_utils import torch_double_edge_swap
 
 
 def rewire(g_pyg, n_iter=100):
-    """ Apply (u, v), (u', v') --> (u, v'), (v, u') to randomize the graph.
+    """fully-vectorized double edge swap. drop-in replacement for the
+    networkx-based version. preserves node features (x) and degree
+    sequence exactly. drops the connectivity-preservation check —
+    fine for negative samples used in contrastive losses.
 
-    mirrors real_world.rewire: operates on a pyg Data, routes through networkx
-    for the classical double edge swap, preserves node features via the `x`
-    attribute. returns a new pyg Data with the rewired edge set.
+    keeps the n_iter parameter name for call-site compatibility; each
+    iteration in the original corresponded to one swap, so n_iter maps
+    directly to n_swaps in the vectorized version.
     """
-    has_features = g_pyg.x is not None
-    if has_features:
-        g_nx = to_networkx(g_pyg, node_attrs=['x'])
-    else:
-        g_nx = to_networkx(g_pyg)
-    rewired_g = g_nx.copy()
-    for n in range(n_iter):
-        e1, e2 = random.sample(list(g_nx.edges()), 2)
-        rewired_g.remove_edges_from([e1, e2])
-        rewired_g.add_edges_from([(e1[0], e2[1]), (e1[1], e2[0])])
-
-    rewired_g.remove_edges_from(list(nx.selfloop_edges(rewired_g)))
-    if has_features:
-        rewired_pyg = from_networkx(rewired_g, group_node_attrs=['x'])
-    else:
-        rewired_pyg = from_networkx(rewired_g)
+    new_edge_index = torch_double_edge_swap(g_pyg.edge_index, n_swaps=n_iter)
+    rewired_pyg = Data(x=g_pyg.x, edge_index=new_edge_index)
     return rewired_pyg
-
 
 class SysTxtDataset(Dataset):
     def __init__(self, root, max_degree=None, n_features=None, transform=None, pre_transform=None):

@@ -171,13 +171,25 @@ def sys_train(model,
 
             optimizer.zero_grad()
 
+            # timing instrumentation: first 3 batches per epoch get profiled.
+            # all timings are wall-clock ms; on cpu/mps that's accurate without
+            # cuda sync. set DO_TIMING False to silence.
+            DO_TIMING = batch_idx < 3
+            t_fwd_pos = t_rec = t_neg = t_fwd_neg = t_freq = t_sil = t_back = 0.0
+
+            if DO_TIMING:
+                t0 = time.time()
             xx_pos, pp_pos, ee_pos, _, merge_info_pos, internals_pos = _forward(model, pos, device)
+            if DO_TIMING:
+                t_fwd_pos = time.time() - t0
 
             loss = 0
             backward = False
             warmup_done = False
 
             if controller.keep_going('rec') and not hard_embed:
+                if DO_TIMING:
+                    t0 = time.time()
                 if rec_kernel == 'wl':
                     rec_loss = model.rec_loss_wl(xx_pos,
                                                  ee_pos,
@@ -194,6 +206,8 @@ def sys_train(model,
                                               internals_pos,
                                               draw=False
                                               )
+                if DO_TIMING:
+                    t_rec = time.time() - t0
                 rec_loss_tot += rec_loss.item()
                 backward = True
                 loss += rec_loss
@@ -202,8 +216,17 @@ def sys_train(model,
 
             if warmup_done:
                 if mode in ('mot', 'combined') and controller.keep_going('mot'):
+                    if DO_TIMING:
+                        t0 = time.time()
                     neg = _make_neg(pos)
+                    if DO_TIMING:
+                        t_neg = time.time() - t0
+                        t0 = time.time()
+
                     xx_neg, pp_neg, ee_neg, _, merge_info_neg, internals_neg = _forward(model, neg, device)
+                    if DO_TIMING:
+                        t_fwd_neg = time.time() - t0
+                        t0 = time.time()
 
                     mot_loss = model.freq_loss(internals_pos,
                                                internals_neg,
@@ -215,25 +238,49 @@ def sys_train(model,
                                                lam=lam,
                                                beta=beta
                                                )
+                    if DO_TIMING:
+                        t_freq = time.time() - t0
                     loss += mot_loss
                     mot_loss_tot += mot_loss.item()
                     backward = True
 
                 if mode in ('sil', 'combined') and controller.keep_going('sil'):
+                    if DO_TIMING:
+                        t0 = time.time()
                     sil_loss = model.sil_loss(internals_pos,
                                               merge_info_pos,
                                               sil_tracker,
                                               momentum=sil_momentum)
+                    if DO_TIMING:
+                        t_sil = time.time() - t0
                     loss += sil_loss * lam
                     sil_loss_tot += sil_loss.item()
                     backward = True
 
             if backward:
+                if DO_TIMING:
+                    t0 = time.time()
                 loss.backward()
+                if DO_TIMING:
+                    t_back = time.time() - t0
                 clip_grad_norm_(model.parameters(), max_norm=1.0)
                 optimizer.step()
             else:
                 done_training = True
+
+            if DO_TIMING and warmup_done:
+                # only print during mot+sil phase; the rec-only phase is
+                # already fast enough we don't need to profile it
+                print(
+                    f"[e{epoch} b{batch_idx}] "
+                    f"fwd_pos={t_fwd_pos*1000:.0f}ms "
+                    f"neg={t_neg*1000:.0f}ms "
+                    f"fwd_neg={t_fwd_neg*1000:.0f}ms "
+                    f"freq={t_freq*1000:.0f}ms "
+                    f"sil={t_sil*1000:.0f}ms "
+                    f"back={t_back*1000:.0f}ms "
+                    f"total={(t_fwd_pos+t_neg+t_fwd_neg+t_freq+t_sil+t_back)*1000:.0f}ms"
+                )
 
         N = max_batches if max_batches > 0 else len(train_loader)
 

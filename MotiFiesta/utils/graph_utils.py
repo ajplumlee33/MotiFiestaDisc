@@ -12,15 +12,9 @@ from torch_geometric.utils import k_hop_subgraph
 
 
 def induced_edge_filter_(G, roots, depth=1):
-    """
-        Remove edges in G introduced by the induced
-        sugraph routine.
-        Only keep edges which fall within a single
-        node's neighbourhood.
-        :param G: networkx subgraph
-        :param roots: nodes to use for filtering
-        :param depth: size of neighbourhood to take around each node.
-        :returns clean_g: cleaned graph
+    """Remove edges in G introduced by the induced subgraph routine.
+
+    Only keep edges which fall within a single node's neighbourhood.
     """
     if depth < 1:
         depth = 1
@@ -32,8 +26,7 @@ def induced_edge_filter_(G, roots, depth=1):
         flat_neighbors = flat_neighbors.union(root_neighbors)
 
     flat_neighbors = list(flat_neighbors)
-    subG = G.subgraph(flat_neighbors)
-    subG = subG.copy()
+    subG = G.subgraph(flat_neighbors).copy()
     kill = []
     for (u, v) in subG.edges():
         for nei in neighbourhoods:
@@ -45,12 +38,14 @@ def induced_edge_filter_(G, roots, depth=1):
     subG.remove_edges_from(kill)
     return subG
 
+
 def induced_edge_filter(G, roots):
     kill = []
     for (u, v) in G.edges():
         if u not in roots and v not in roots:
             kill.append((u, v))
     G.remove_edges_from(kill)
+
 
 def bfs_expand(G, initial_nodes, hops=2):
     total_nodes = [list(initial_nodes)]
@@ -59,8 +54,7 @@ def bfs_expand(G, initial_nodes, hops=2):
         for n in total_nodes[d]:
             for nei in G.neighbors(n):
                 depth_ring.append(nei)
-        else:
-            total_nodes.append(depth_ring)
+        total_nodes.append(depth_ring)
     return set(itertools.chain(*total_nodes))
 
 
@@ -77,32 +71,24 @@ def bfs(G, initial_node, depth=2):
         total_nodes.append(depth_ring)
         yield depth_ring
 
+
 def to_graphs(batch):
-    """Convert batch to list of networkx subgraphs"""
+    """Convert batch to list of networkx subgraphs."""
     big_g = to_networkx(batch)
-    nodelist = lambda i : list(np.argwhere(batch.batch==i).numpy()[0])
-    graphs = [big_g.subgraph(nodelist(i)).copy() \
+    nodelist = lambda i: list(np.argwhere(batch.batch == i).numpy()[0])
+    graphs = [big_g.subgraph(nodelist(i)).copy()
               for i in range(batch.num_graphs)]
     return graphs
 
 
 def _is_single_source_graph(graphs):
-    """
-    single-graph mode passes one igraph.Graph instead of a list of nx graphs.
-    detecting by igraph class keeps the collection-mode path untouched.
-    """
+    """single-graph mode passes one igraph.Graph instead of a list of nx graphs."""
     from igraph import Graph as IGraph
     return isinstance(graphs, IGraph)
 
 
 def get_edge_subgraphs(edge_index, spotlights, level, graphs, x_base, batch, hop=False):
-    """Return one spotlight subgraph per edge.
-
-    in the original collection mode, ``graphs`` is a list of per-batch nx
-    subgraphs and ``batch`` routes each spotlight to the right one. in
-    single-graph mode (used by sys_train / systxt), ``graphs`` is a single
-    igraph.Graph spanning the full source graph and ``batch`` is ignored.
-    """
+    """one spotlight subgraph per edge, dual-mode."""
     single = _is_single_source_graph(graphs)
 
     subgraphs = []
@@ -124,10 +110,9 @@ def get_edge_subgraphs(edge_index, spotlights, level, graphs, x_base, batch, hop
 
     return subgraphs, X
 
+
 def get_subgraphs(node_ids, spotlights, level, graphs, x_base, batch, hop=False):
-    """Return one spotlight subgraph per node_id. same dual-mode contract as
-    get_edge_subgraphs.
-    """
+    """one spotlight subgraph per node_id, dual-mode."""
     single = _is_single_source_graph(graphs)
 
     subgraphs = []
@@ -147,11 +132,10 @@ def get_subgraphs(node_ids, spotlights, level, graphs, x_base, batch, hop=False)
 
     return subgraphs, X
 
+
 def get_subgraph_edge(u, v, spotlights, level, graphs, batch, hop=False):
-    """
-        Get spotlight from contracting edge (u,v)
-    """
-    u,v = u.item(), v.item()
+    """get spotlight from contracting edge (u, v)."""
+    u, v = u.item(), v.item()
     spotlight_u = spotlights[level][u]
     spotlight_v = spotlights[level][v]
     spotlight_uv = spotlight_u | spotlight_v
@@ -164,8 +148,9 @@ def get_subgraph_edge(u, v, spotlights, level, graphs, batch, hop=False):
 
     return graph.subgraph(spotlight_uv).copy()
 
+
 def expand_spotlights(spotlights, t, edge_index, k):
-    """ Merge k-hop neighbhourhood spotlights. """
+    """merge k-hop neighbourhood spotlights."""
     if k < 1:
         return
     nodes = range(len(spotlights[t]))
@@ -182,30 +167,30 @@ def expand_spotlights(spotlights, t, edge_index, k):
 
     for n, sp in new_spotlights.items():
         spotlights[t][n] = sp
-    pass
+
 
 def update_spotlights(spotlights, clusters, t):
-    """ Keeps track of the spotlight of each node.
+    """keeps track of the spotlight of each node.
 
-        >>> from collections import defaultdict
-        >>> import torch
-        >>> SL = {0: {0: {1, 2}, 1: {3, 4} }}
-        >>> clusters = torch.tensor([0, 0], dtype=torch.long)
-        >>> update_spotlights(SL, clusters, 1)
-        >>> SL
-        {0: {0: {1, 2}, 1: {3, 4}}, 1: defaultdict(<class 'set'>, {0: {1, 2, 3, 4}})}
+    >>> from collections import defaultdict
+    >>> import torch
+    >>> SL = {0: {0: {1, 2}, 1: {3, 4} }}
+    >>> clusters = torch.tensor([0, 0], dtype=torch.long)
+    >>> update_spotlights(SL, clusters, 1)
+    >>> SL
+    {0: {0: {1, 2}, 1: {3, 4}}, 1: defaultdict(<class 'set'>, {0: {1, 2, 3, 4}})}
     """
     spotlights[t] = defaultdict(set)
-    for i,c in enumerate(clusters):
+    for i, c in enumerate(clusters):
         spotlights[t][c.item()] |= spotlights[t-1][i]
-    pass
+
 
 def update_merge_graph(merge_graph, clusters, t):
-    """ Keeps track of the children of each node."""
+    """keeps track of the children of each node."""
     merge_graph[t] = defaultdict(set)
-    for i,c in enumerate(clusters):
+    for i, c in enumerate(clusters):
         merge_graph[t][c.item()] |= {i}
-    pass
+
 
 def draw_one_instance(g_data, spotlight, show=False):
     G = to_networkx(g_data)
@@ -213,10 +198,12 @@ def draw_one_instance(g_data, spotlight, show=False):
     if show:
         plt.show()
 
-def ablate_graphs(graphs, method='swap', n_swaps=5):
-    """ Take a batch of graphs and perform an ablation which is meant
-    to be used as the 'configuration' model."""
 
+def ablate_graphs(graphs, method='swap', n_swaps=5):
+    """take a batch of graphs and perform an ablation meant to be used
+    as the 'configuration' model. legacy networkx-based path; for new
+    single-graph rewiring use torch_double_edge_swap instead.
+    """
     graphs_swap = []
     for g in graphs:
         graph_swap = g.copy().to_undirected()
@@ -225,13 +212,14 @@ def ablate_graphs(graphs, method='swap', n_swaps=5):
 
     return graphs_swap
 
-def batch_to_node_indices(batch):
-    """ Return node indices within each graph for a given batch.
 
-        >>> import torch
-        >>> batch = torch.tensor([0, 0, 0, 1, 1, 2], dtype=torch.long)
-        >>> batch_to_node_indices(batch)
-        [0, 1, 2, 0, 1, 0]
+def batch_to_node_indices(batch):
+    """return node indices within each graph for a given batch.
+
+    >>> import torch
+    >>> batch = torch.tensor([0, 0, 0, 1, 1, 2], dtype=torch.long)
+    >>> batch_to_node_indices(batch)
+    [0, 1, 2, 0, 1, 0]
     """
     assert bool((batch == torch.sort(batch)[0]).all()), "batch indices not sorted"
     indices = [0]
@@ -317,6 +305,70 @@ def get_edge_subgraphs_tensor(edge_index, spotlight_assignment, n_id, level,
         X.append(node_features)
 
     return subgraphs, X
+
+
+# ---------------------------------------------------------------------------
+# negative sample generation
+# ---------------------------------------------------------------------------
+
+def torch_double_edge_swap(edge_index, n_swaps=20):
+    """parallel double edge swap for negative sample generation.
+
+    classical double edge swap: pick two undirected edges (a, b) and (c, d),
+    swap to (a, d) and (b, c). networkx does this sequentially with a
+    connectivity-preservation check; here we pick 2*n_swaps disjoint
+    canonical edges, pair them up, and apply all swaps simultaneously.
+
+    drops the connectivity constraint - fine for negative samples used in
+    contrastive losses where the goal is structural randomization, not
+    preservation of a single connected component. preserves degree sequence
+    exactly because each swap only rearranges existing endpoints.
+
+    operates on the canonical (src < dst) representation and returns the
+    symmetric (both-direction) edge_index that pyg expects.
+    """
+    device = edge_index.device
+    src_full, dst_full = edge_index[0], edge_index[1]
+
+    canon = src_full < dst_full
+    can_src = src_full[canon].clone()
+    can_dst = dst_full[canon].clone()
+    n_canon = can_src.size(0)
+
+    if n_canon < 2:
+        return edge_index
+
+    n_use = min(2 * n_swaps, n_canon - (n_canon % 2))
+    if n_use < 2:
+        return edge_index
+
+    perm = torch.randperm(n_canon, device=device)[:n_use]
+    i_idx = perm[0::2]
+    j_idx = perm[1::2]
+
+    # swap destinations between paired edges
+    new_dst_i = can_dst[j_idx].clone()
+    new_dst_j = can_dst[i_idx].clone()
+    can_dst[i_idx] = new_dst_i
+    can_dst[j_idx] = new_dst_j
+
+    # restore canonical form after the swap may have reversed it
+    swapped = can_src > can_dst
+    final_src = torch.where(swapped, can_dst, can_src)
+    final_dst = torch.where(swapped, can_src, can_dst)
+
+    # drop self-loops the swap may have created
+    mask = final_src != final_dst
+    final_src = final_src[mask]
+    final_dst = final_dst[mask]
+
+    # rebuild symmetric edge_index (both directions, as pyg expects)
+    new_edge_index = torch.stack([
+        torch.cat([final_src, final_dst]),
+        torch.cat([final_dst, final_src])
+    ])
+
+    return new_edge_index
 
 
 if __name__ == "__main__":

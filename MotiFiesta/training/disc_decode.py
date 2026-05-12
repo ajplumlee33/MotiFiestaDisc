@@ -79,6 +79,10 @@ class DiscHashDecoder(Decoder):
         cluster = cluster_chain[level - 1]
         children = (cluster == node).nonzero(as_tuple=False).squeeze(-1).tolist()
 
+        if len(children) == 0:
+            # orphan supernode with no predecessor — contribute nothing
+            return 0
+
         if len(children) < 2:
             return DiscHashDecoder.total_sigma(level - 1, children[0], cluster_chain, sigmas, ee)
 
@@ -191,6 +195,24 @@ class DiscHashDecoder(Decoder):
             hashes = []
 
             spot_at_level = spot_assign[self.level]
+
+            if idx == 0:  # only print for first batch to avoid spam
+                print(f"len(embs[{self.level}]): {len(embs[self.level])}")
+            print(f"unique spot_assign values: {len(torch.unique(spot_at_level))}")
+            print(f"max spot_assign: {spot_at_level.max().item()}")
+            print(f"min spot_assign: {spot_at_level.min().item()}")
+            
+            print("\nper-level breakdown:")
+            for t in range(len(spot_assign)):
+                s = spot_assign[t]
+                print(f"  spot_assign[{t}]: len={len(s)} "
+                      f"unique={len(torch.unique(s))} "
+                      f"max={s.max().item()}")
+            for t in range(len(cluster_chain)):
+                c = cluster_chain[t]
+                print(f"  cluster_chain[{t}]: len={len(c)} "
+                      f"unique={len(torch.unique(c))} "
+                      f"max={c.max().item()}")
 
             for i, x in enumerate(embs[self.level]):
                 h = hash_table.index(x.detach().numpy())[0]

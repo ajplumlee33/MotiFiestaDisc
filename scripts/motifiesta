@@ -61,6 +61,8 @@ if function == 'train':
     parser.add_argument("--score-method", default="sigmoid", help="Edge scoring method: (sigmoid, softmax-neighbors, softmax-all)")
     parser.add_argument("--merge-method", default="sum", help="Edge merge method: (sum, cat, set2set)")
     parser.add_argument("--hard-embed", action='store_true', help="Whether to use hard embedding using degree histogram.")
+    parser.add_argument('--parallel-matching', action='store_true',
+                    help='use gpu-parallel edge matching instead of sequential greedy')
 
     # --- Synthetic single-graph dataset flags (used only when data_root --
     # contains 'sys_synth'; silently ignored otherwise) -----------------------
@@ -103,6 +105,7 @@ if function == 'train':
                         'edge_score_method': args.score_method,
                         'merge_method': args.merge_method,
                         'hard_embed': args.hard_embed,
+                        'parallel_matching': args.parallel_matching,
                          },
                'train': {
                         'epochs': args.epochs,

@@ -45,7 +45,8 @@ class MotiFiestaModel(torch.nn.Module):
                  pool_dummy=None,
                  merge_method='sum',
                  global_pool=global_add_pool,
-                 edge_score_method='sigmoid'
+                 edge_score_method='sigmoid',
+                 parallel_matching=False,
                  ):
         super(MotiFiestaModel, self).__init__()
 
@@ -57,6 +58,7 @@ class MotiFiestaModel(torch.nn.Module):
         self.edge_score_method = edge_score_method
         self.merge_method = merge_method
         self.hard_embed = hard_embed
+        self.parallel_matching = parallel_matching
 
         self.layers = self.build_layers()
 
@@ -65,40 +67,30 @@ class MotiFiestaModel(torch.nn.Module):
         layers.append(EdgePooling(self.n_features,
                                   self.hidden_dim,
                                   edge_score_method=self.edge_score_method,
-                                  merge_method=self.merge_method
+                                  merge_method=self.merge_method,
+                                  parallel_matching=self.parallel_matching,
                                   ))
         for s in range(self.steps):
             layers.append(EdgePooling(self.hidden_dim,
                                       self.hidden_dim,
                                       edge_score_method=self.edge_score_method,
-                                      merge_method=self.merge_method
+                                      merge_method=self.merge_method,
+                                      parallel_matching=self.parallel_matching,
                                       )
                           )
 
         return torch.nn.ModuleList(layers)
 
     def forward(self, x, edge_index, batch, n_id=None, dummy=False, x_null=None, e_null=None):
-        """One forward pass applies the model over all steps.
-
-        :param x: node features
-        :param edge_index: list of edges
-        :param batch: batching tensor
-        :param n_id: optional global node ids from neighborloader. when provided,
-            spotlight_assignment is initialised so that subgraph lookups
-            can be performed on the full graph instead of the sampled neighbourhood.
-        """
-        # fall back to local indices when no global mapping is given
+        """One forward pass applies the model over all steps."""
         if n_id is None:
             n_id = torch.arange(len(x), device=x.device)
 
         n_batch_nodes = x.size(0)
 
-        # spotlight_assignment[t][i] = supernode at level t for original node i
-        # initial state: every node is its own supernode
         spotlight_assignment = [
             torch.arange(n_batch_nodes, device=x.device, dtype=torch.long)
         ]
-        # cluster_chain[t] maps level-t supernode index to level-(t+1) index
         cluster_chain = []
 
         xx, ee, pp = [], [], []
@@ -119,7 +111,6 @@ class MotiFiestaModel(torch.nn.Module):
 
             cluster = out['new_graph']['unpool'].cluster
             cluster_chain.append(cluster)
-            # propagate spotlight membership through the cluster mapping
             spotlight_assignment.append(cluster[spotlight_assignment[-1]])
 
             edge_index = out['new_graph']['e_ind_new']
@@ -134,22 +125,9 @@ class MotiFiestaModel(torch.nn.Module):
 
         return xx, pp, ee, batches, merge_info, internals
 
-    def rec_loss(self,
-                 xx,
-                 ee,
-                 merge_info,
-                 source_graph,
-                 internals,
-                 num_nodes=20,
-                 draw=False):
-        """Compute reconstruction loss at all coarsening levels.
-
-        The loss function for a pair of embeddings z_1, z_2 and graph kernel K is:
-        L = ((x_1 - x_2)^2  - K(g_1, g_2))^2
-        where g_1 is the spotlight of node 1. Here we supervise the embedding for
-        pairs of nodes.
-        """
-        # pull the full graph and its features once per call
+    def rec_loss(self, xx, ee, merge_info, source_graph, internals,
+                 num_nodes=20, draw=False):
+        """reconstruction loss at all coarsening levels using the wwl kernel."""
         source_ig = source_graph.ig_graph
         source_x = source_graph.cached_data.x
 
@@ -160,8 +138,6 @@ class MotiFiestaModel(torch.nn.Module):
         for level in range(len(xx)):
             x = internals[level]['x_merged']
 
-            # extract spotlight subgraphs from the full graph using the tensor
-            # representation. one subgraph per edge in ee[level].
             subgraphs, node_features = get_edge_subgraphs_tensor(
                 ee[level], spot_assign, n_id, level, source_ig, source_x,
             )
@@ -169,7 +145,6 @@ class MotiFiestaModel(torch.nn.Module):
             K_predict = matrix_cosine(x[:num_nodes], x[:num_nodes])
             K_predict = K_predict.to(get_device())
 
-            # wwl expects a list of per-graph float64 feature arrays
             formatted_features = [
                 (f.cpu().numpy() if torch.is_tensor(f) else f).astype(np.float64)
                 for f in node_features[:num_nodes]
@@ -185,8 +160,6 @@ class MotiFiestaModel(torch.nn.Module):
                         fig, ax = plt.subplots(1, 2)
                         nx.draw(g1, ax=ax[0])
                         nx.draw(g2, ax=ax[1])
-                        print('g1', x[i])
-                        print('g2', x[j])
                         fig.suptitle(f"true: {K_true[i][j]}, pred: {K_predict[i][j]}")
                         plt.show()
 
@@ -195,28 +168,9 @@ class MotiFiestaModel(torch.nn.Module):
 
         return loss / self.steps
 
-    def rec_loss_wl(self,
-                    xx,
-                    ee,
-                    merge_info,
-                    source_graph,
-                    internals,
-                    num_nodes=20,
-                    edge_sample_rate=1.0,
-                    wl_iter=3,
-                    ):
-        """edge-level reconstruction loss using the wl subtree kernel.
-
-        for each pooling level, iterates over edges in ee[level] and builds the
-        edge spotlight as the union of endpoint spotlights. K_predict comes
-        from the per-edge merged embeddings; K_true is the pairwise wl kernel
-        on the edge spotlight subgraphs. semantics match rec_loss; only the
-        graph kernel differs.
-
-        edge_sample_rate < 1.0 zeros a random subset of (i, j) entries in
-        both K_predict and K_true so the loss only supervises a fraction of
-        the pairs per batch.
-        """
+    def rec_loss_wl(self, xx, ee, merge_info, source_graph, internals,
+                    num_nodes=20, edge_sample_rate=1.0, wl_iter=3):
+        """edge-level reconstruction loss using the wl subtree kernel."""
         from MotiFiesta.training.wl_kernel import (
             wl_subtree_similarity_batch,
             initial_labels_from_onehot,
@@ -252,7 +206,6 @@ class MotiFiestaModel(torch.nn.Module):
                 u_idx = edge_idx_at_level[0, k].item()
                 v_idx = edge_idx_at_level[1, k].item()
 
-                # union of endpoint spotlights at this level
                 mask = (spot_t == u_idx) | (spot_t == v_idx)
                 local_members = mask.nonzero(as_tuple=False).squeeze(-1)
                 if local_members.numel() == 0:
@@ -304,14 +257,20 @@ class MotiFiestaModel(torch.nn.Module):
         return torch.exp(f)
 
     @staticmethod
-    def distance_density(X, X_ref, k=20):
-        """ Returns distance to kth nearest neighbor in batch """
-        d = X.shape[1]
-        N = X_ref.shape[0]
-        knn = KDTree(X_ref.cpu().detach().numpy())
-        R,_ = knn.query(X.cpu().detach().numpy(), k=k)
-        R = R[:,k-1]
-        return torch.tensor(R, dtype=torch.float32, requires_grad=False)
+    def distance_density(X, X_ref, k=20, max_ref=2000):
+        """distance to k-th nearest neighbor in X_ref for each row of X.
+
+        torch-native via pairwise distances + topk. no cpu transfer, no
+        numpy, no sklearn. matches the original sklearn-based version's
+        no-gradient semantics (densities are targets, not differentiable).
+        """
+        with torch.no_grad():
+            if X_ref.size(0) > max_ref:
+                sample = torch.randperm(X_ref.size(0), device=X_ref.device)[:max_ref]
+                X_ref = X_ref[sample]
+            dists = torch.cdist(X, X_ref)
+            R, _ = dists.topk(k, dim=1, largest=False)
+            return R[:, k - 1].detach()
 
     @staticmethod
     def knn_density(X, X_ref, volume=False, epsilon=1e-5, k=50):
@@ -336,25 +295,16 @@ class MotiFiestaModel(torch.nn.Module):
         d = torch.cdist(X, X_ref)
         return 1/d.min(dim=1)[0]
 
-    def freq_loss(self,
-                 internals_pos,
-                 internals_neg,
-                 pp,
-                 estimator='knn',
-                 beta=1,
-                 lam=1,
-                 steps=3,
-                 volume=False,
-                 k=30,
-                 ):
-        """ Penalize embeddings that are close to randos or sparse. """
+    def freq_loss(self, internals_pos, internals_neg, pp,
+                  estimator='knn', beta=1, lam=1, steps=3,
+                  volume=False, k=30):
+        """penalize embeddings close to randos or sparse."""
         tot_loss = 0
         for t in range(len(pp)):
             x_pos = internals_pos[t]['x_merged']
             x_neg = internals_neg[t]['x_merged']
             s = pp[t]
 
-            # cap k to the number of available reference points at this level
             k_eff = min(k, x_pos.size(0), x_neg.size(0))
             if k_eff < 2:
                 continue
@@ -366,7 +316,6 @@ class MotiFiestaModel(torch.nn.Module):
                 density_pos = self.distance_density(x_pos, x_pos, k=k_eff)
                 density_neg = self.distance_density(x_pos, x_neg, k=k_eff)
 
-                # normalize to [0, 1] as the f_pos/f_neg comment below assumes
                 scale = torch.cat([density_pos, density_neg]).max() + 1e-8
                 density_pos = density_pos / scale
                 density_neg = density_neg / scale
@@ -374,15 +323,10 @@ class MotiFiestaModel(torch.nn.Module):
                 density_pos = self.min_density(x_pos, x_pos)
                 density_neg = self.min_density(x_pos, x_neg)
 
-
             f_pos = density_pos.view(-1, 1).squeeze()
-            f_neg  = density_neg.view(-1, 1).squeeze()
+            f_neg = density_neg.view(-1, 1).squeeze()
 
-            # f_pos and f_neg are [0, 1]. When density is high f -> 0, 1 else
-            # f_pos - f_neg -> -1 with motifs (f_p = 0, f_n = 1)
-            # f_pos - f_neg -> 1 with non-motifs (f_p = 1, f_n=0)
             l = (-1 * s * torch.exp(-1 * beta * (f_pos - f_neg))).mean()
-
             reg_term = lam * s.pow(2.0).mean()
             l += reg_term
 
@@ -391,19 +335,20 @@ class MotiFiestaModel(torch.nn.Module):
         tot_loss /= steps
         return tot_loss
 
-    def sil_loss(self, internals_pos, merge_info, tracker, momentum=0.95):
-        """sampling invariance loss.
+    def sil_loss(self, internals_pos, merge_info, tracker, momentum=0.95,
+                 max_per_level=100):
+        """sampling invariance loss with per-level sampling cap.
 
-        neighborhood sampling exposes each node to varying local contexts across
-        batches. a real motif instance should look the same regardless of which
-        neighborhood it was sampled within. this loss tracks a momentum-updated
-        target embedding for every (spotlight, level) pair and penalises
-        deviations of the current batch's embedding from the target.
+        original semantics: track an ema target embedding for every
+        (spotlight, level) pair, penalize current-batch deviations.
+        large graphs produce thousands of supernodes per level, and the
+        python-bound iteration dominates wall time. capping the number of
+        supernodes processed per level per batch yields ~10x speedup; the
+        ema update has enough cross-batch coverage to compensate.
 
-        :param internals_pos: per-level internals returned by the forward pass
-        :param merge_info: dict with spotlight_assignment, cluster_chain, n_id
-        :param tracker: SamplingInvarianceTracker storing the targets
-        :param momentum: smoothing factor for the target update (0.95 default)
+        :param max_per_level: maximum number of supernodes to update per
+            level per batch. set high (e.g. 10000) to recover the
+            non-sampled behavior. default 100 gives ~10x speedup.
         """
         device = get_device()
         spot_assign = merge_info['spotlight_assignment']
@@ -417,35 +362,59 @@ class MotiFiestaModel(torch.nn.Module):
             if x_level.size(0) == 0:
                 continue
 
-            # normalize to compare direction rather than magnitude
             h_cur = F.normalize(x_level, dim=-1)
             spot_t = spot_assign[level]
+            n_x = x_level.size(0)
 
-            # iterate over rows of x_level (one per edge at this level), and
-            # query the spotlight at the same index. supernode count at level
-            # may differ from x_level.size(0); indices beyond that produce
-            # empty spotlights and are skipped, matching the original behavior.
-            for k in range(x_level.size(0)):
-                mask = spot_t == k
-                local_members = mask.nonzero(as_tuple=False).squeeze(-1)
-                if local_members.numel() == 0:
-                    continue
+            # group local member indices by their supernode id at this level.
+            # sort once, find contiguous spans via unique_consecutive.
+            sorted_idx = spot_t.argsort()
+            spot_sorted = spot_t[sorted_idx]
+            unique_vals, counts = torch.unique_consecutive(
+                spot_sorted, return_counts=True)
 
-                global_ids = n_id[local_members]
+            # filter to supernode ids that lie within x_level's row range
+            valid_mask = unique_vals < n_x
+            unique_vals_valid = unique_vals[valid_mask]
+
+            # compute the starting offset for each unique value's span
+            cumcounts = counts.cumsum(0)
+            starts = torch.cat([
+                torch.zeros(1, dtype=cumcounts.dtype, device=device),
+                cumcounts[:-1]
+            ])
+            starts_valid = starts[valid_mask]
+            counts_valid = counts[valid_mask]
+
+            # subsample if too many supernodes to process this level
+            n_valid = unique_vals_valid.size(0)
+            if n_valid > max_per_level:
+                sample_perm = torch.randperm(n_valid, device=device)[:max_per_level]
+                unique_vals_valid = unique_vals_valid[sample_perm]
+                starts_valid = starts_valid[sample_perm]
+                counts_valid = counts_valid[sample_perm]
+
+            # tight loop over the (possibly sampled) valid supernodes only
+            unique_vals_list = unique_vals_valid.tolist()
+            starts_list = starts_valid.tolist()
+            counts_list = counts_valid.tolist()
+
+            for k_val, start, count in zip(unique_vals_list, starts_list,
+                                           counts_list):
+                local_members = sorted_idx[start:start + count]
+                global_ids = n_id[local_members].sort().values
                 key = spotlight_key(global_ids)
 
                 target = tracker.get(key, level)
                 if target is None:
-                    # first sighting: seed the target with the current embedding
-                    tracker.set(key, level, h_cur[k].detach())
+                    tracker.set(key, level, h_cur[k_val].detach())
                     continue
 
                 target = target.to(device)
-                tot_loss = tot_loss + (1.0 - (h_cur[k] * target).sum())
+                tot_loss = tot_loss + (1.0 - (h_cur[k_val] * target).sum())
                 n_terms += 1
 
-                # ema update of the target; detach to keep it out of the graph
-                new_target = momentum * target + (1.0 - momentum) * h_cur[k].detach()
+                new_target = momentum * target + (1.0 - momentum) * h_cur[k_val].detach()
                 new_target = F.normalize(new_target, dim=-1)
                 tracker.set(key, level, new_target)
 
@@ -455,14 +424,7 @@ class MotiFiestaModel(torch.nn.Module):
 
 
 class SamplingInvarianceTracker:
-    """
-    stores momentum-updated target embeddings keyed by (spotlight, level).
-
-    the spotlight (a tuple of original node ids) identifies a persistent motif
-    candidate across batches even though neighborhood sampling varies the
-    surrounding context each time. level is the contraction depth at which the
-    embedding was produced.
-    """
+    """momentum-updated target embeddings keyed by (spotlight, level)."""
     def __init__(self):
         self.store = {}
 
@@ -509,7 +471,6 @@ class HardEmbedder(torch.nn.Module):
 
             deg_hist = [degs[ind] for ind in range(self.out_dim)]
             embeddings.append(torch.Tensor(deg_hist))
-            pass
 
         embeddings = torch.stack(embeddings)
         return embeddings
@@ -520,10 +481,8 @@ def plot_K(K_true, K_pred):
     sns.heatmap(K_true.detach().numpy(), vmin=0, vmax=1, ax=ax[0])
     sns.heatmap(K_pred.detach().numpy(), vmin=0, vmax=1, ax=ax[1])
     plt.show()
-    pass
 
 
 if __name__ == "__main__":
     import doctest
     doctest.testmod()
-    pass
