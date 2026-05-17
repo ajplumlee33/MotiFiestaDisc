@@ -20,7 +20,7 @@ class Decoder:
         print(self.model)
 
         root = dataset_root if dataset_root is not None else dataset_id
-        self.dataset = get_loader(root=root, name=dataset_id)
+        self.dataset = get_loader(root=root, name=dataset_id, max_degree=18)
         pass
 
     def decode(self):
@@ -42,7 +42,7 @@ class DiscHashDecoder(Decoder):
     when ground truth is present on the input graph (is_motif and motif_id node
     attributes, as produced by synthetic.py), also computes evaluation metrics:
         pattern-level precision/recall against embedded g6 labels,
-        node-level jaccard against embedded motif nodes,
+        lsh-bucket m-jaccard against motif type labels (paper methodology),
         instance-level recall against embedded motif instances.
     """
 
@@ -68,11 +68,19 @@ class DiscHashDecoder(Decoder):
 
     @staticmethod
     def total_sigma(level, node, tree, sigmas, ee):
-        """ recursively sum edge scores along the contraction path. """
+        """recursively sum edge scores along the contraction path.
+
+        children of `node` at `level` are the level-(level-1) supernodes
+        in tree[level][node].
+        """
         if level == 0:
             return 0
 
         children = list(tree[level][node])
+
+        if len(children) == 0:
+            # orphan supernode with no predecessor — contribute nothing
+            return 0
 
         if len(children) < 2:
             return DiscHashDecoder.total_sigma(level - 1, children[0], tree, sigmas, ee)
@@ -176,14 +184,32 @@ class DiscHashDecoder(Decoder):
 
             source_nx = to_networkx(g, to_undirected=True)
 
+            # pull the dict-based merge_info fields
+            spotlights_all = merge_info['spotlights']  # dict[level][supernode_id] = set of global node ids
+            tree = merge_info['tree']                  # dict[level][supernode_id] = set of child supernode ids
+
             spotlights = []
             scores = []
             hashes = []
 
-            for i, x in enumerate(embs[self.level]):
-                h = hash_table.index(x.detach().numpy())[0]
-                spot = set(merge_info['spotlights'][self.level][i])
-                score = self.total_sigma(self.level, i, merge_info['tree'],
+            spot_at_level = spotlights_all[self.level]
+
+            # center embeddings before hashing. random-hyperplane lsh
+            # measures angular similarity from the origin, so if all
+            # embeddings sit in one corner of the space (e.g. mean=-3.5)
+            # they collapse to the same bucket regardless of hash_dim or
+            # internal spread. zero-mean the level-T embeddings so the
+            # hyperplanes cut through the data, not past it.
+            level_emb = embs[self.level]
+            level_emb_centered = level_emb - level_emb.mean(dim=0, keepdim=True)
+
+            for i, x in enumerate(level_emb):
+                h = hash_table.index(level_emb_centered[i].detach().numpy())[0]
+
+                # spotlight is already a set of global node ids
+                spot = set(spot_at_level.get(i, set()))
+
+                score = self.total_sigma(self.level, i, tree,
                                          probas, ee_lookups)
 
                 spotlights.append(spot)
@@ -201,7 +227,7 @@ class DiscHashDecoder(Decoder):
         return results
 
     # ------------------------------------------------------------------
-    # pattern extraction and ranking
+    # pattern extraction and ranking (g6-based, used for nemomap export)
     # ------------------------------------------------------------------
 
     def extract_patterns(self,
@@ -215,6 +241,10 @@ class DiscHashDecoder(Decoder):
         returns dict keyed by g6 label, each value:
           { 'label', 'nodes', 'edges', 'instances': [...],
             'total_score', 'mean_score', 'count' }
+
+        used to drive nemomap export and to compute g6 pattern set-overlap as
+        a sanity check. not used for the primary m-jaccard metric (which is
+        lsh-bucket-based per the paper methodology).
         """
         patterns = defaultdict(lambda: {'instances': [], 'nodes': 0, 'edges': 0})
 
@@ -309,33 +339,47 @@ class DiscHashDecoder(Decoder):
         return hasattr(pyg, 'motif_id') and pyg.motif_id is not None
 
     def _embedded_g6s(self, results):
-        """
-        return the set of canonical g6 labels of the embedded motif topologies.
-        groups nodes by motif_id (motif type), then splits each group into
-        connected components so multiple instances of the same type each
-        contribute their own topology label (which deduplicates in the set).
+        """canonical g6 labels of the embedded motif instances.
+
+        groups nodes by instance_id (each unique value is one planted motif
+        instance) and emits the g6 of each instance's induced subgraph.
+        falls back to motif_id + connected_components for datasets that don't
+        have instance_id (older processed files).
         """
         g6s = set()
         for res in results:
             pyg = res['pyg']
             source_nx = res['source_nx']
-            if not hasattr(pyg, 'motif_id'):
-                continue
-            motif_ids = pyg.motif_id.tolist()
-            groups = defaultdict(set)
-            for node_idx, mid in enumerate(motif_ids):
-                if mid > 0:
-                    groups[mid].add(node_idx)
-            for mid, nodes in groups.items():
-                sub_all = source_nx.subgraph(nodes)
-                # each connected component is one embedded instance
-                for component in nx.connected_components(sub_all):
-                    if len(component) < 2:
+
+            if hasattr(pyg, 'instance_id') and pyg.instance_id is not None:
+                instance_ids = pyg.instance_id.tolist()
+                groups = defaultdict(set)
+                for node_idx, iid in enumerate(instance_ids):
+                    if iid > 0:
+                        groups[iid].add(node_idx)
+                for iid, nodes in groups.items():
+                    if len(nodes) < 2:
                         continue
-                    sub, _ = self._induced_subgraph(source_nx, component)
+                    sub, _ = self._induced_subgraph(source_nx, nodes)
                     if sub.number_of_edges() == 0:
                         continue
                     g6s.add(self._graph6(sub))
+            elif hasattr(pyg, 'motif_id'):
+                # legacy fallback: connected components on motif_id-tagged nodes
+                motif_ids = pyg.motif_id.tolist()
+                groups = defaultdict(set)
+                for node_idx, mid in enumerate(motif_ids):
+                    if mid > 0:
+                        groups[mid].add(node_idx)
+                for mid, nodes in groups.items():
+                    sub_all = source_nx.subgraph(nodes)
+                    for component in nx.connected_components(sub_all):
+                        if len(component) < 2:
+                            continue
+                        sub, _ = self._induced_subgraph(source_nx, component)
+                        if sub.number_of_edges() == 0:
+                            continue
+                        g6s.add(self._graph6(sub))
         return g6s
 
     @staticmethod
@@ -349,10 +393,12 @@ class DiscHashDecoder(Decoder):
     def evaluate(self, results, patterns_ranked):
         """
         type-level evaluation against embedded ground truth.
-        permutation-aligned per-node jaccard between
-        predicted clusters and motif type labels. additionally
-        reports g6 pattern precision/recall: did the predicted top patterns
-        cover the canonical topologies of the embedded motif types.
+
+        primary metric is lsh-bucket m-jaccard, matching the paper's decoding
+        methodology (algorithm 2). also reports g6 pattern set-overlap as a
+        sanity check on the nemomap export side: did the top-ranked g6
+        patterns include the canonical topology of the embedded motifs.
+
         returns an empty dict if no ground truth is present.
         """
         if not self._has_ground_truth(results):
@@ -370,8 +416,9 @@ class DiscHashDecoder(Decoder):
             precision = 0.0
             recall = 0.0
 
-        # original paper-style permutation-aligned per-node jaccard
-        perm_jaccard = self._permutation_jaccard(results, patterns_ranked)
+        # primary metric: lsh-bucket m-jaccard (paper methodology)
+        lsh_jaccard = self._lsh_permutation_jaccard(
+            results, top_n=len(patterns_ranked))
 
         return {
             'embedded_g6s': sorted(embedded_g6s),
@@ -379,18 +426,44 @@ class DiscHashDecoder(Decoder):
             'hit_labels': sorted(hit_labels),
             'pattern_precision': precision,
             'pattern_recall': recall,
-            'jaccard': perm_jaccard,
+            'jaccard': lsh_jaccard,
         }
 
-    def _permutation_jaccard(self, results, patterns_ranked):
+    def _lsh_permutation_jaccard(self, results, top_n=10,
+                                  min_size=3, max_size=8):
         """
-        original paper-style type-level jaccard.
-        treats each predicted pattern rank as a cluster id and each motif_id
-        as a true label. tries all permutations of predicted -> true
-        assignments and returns the best mean jaccard.
+        lsh-bucket m-jaccard, matching the paper's decoding methodology
+        (algorithm 2). spotlights are grouped by their lsh hash bucket,
+        buckets are ranked by mean sigma score (paper algorithm 2 line 7),
+        and the top_n buckets are treated as the predicted motif types for
+        the permutation alignment against motif_id ground truth.
+
+        size filter (min_size, max_size) matches extract_patterns defaults
+        so the lsh pool and the g6 pool see the same spotlights.
         """
-        if not patterns_ranked:
+        bucket_sum_scores = defaultdict(float)
+        bucket_counts = defaultdict(int)
+        bucket_nodes_per_src = defaultdict(lambda: defaultdict(set))
+
+        for src_idx, res in enumerate(results):
+            for spot, score, h in zip(res['spotlights'],
+                                      res['scores'],
+                                      res['hashes']):
+                if not (min_size <= len(spot) <= max_size):
+                    continue
+                bucket_sum_scores[h] += score
+                bucket_counts[h] += 1
+                bucket_nodes_per_src[h][src_idx].update(spot)
+
+        if not bucket_sum_scores:
             return 0.0
+
+        # rank by mean score per bucket (paper algorithm 2, line 7)
+        bucket_mean_scores = {b: bucket_sum_scores[b] / bucket_counts[b]
+                              for b in bucket_sum_scores}
+        top_buckets = sorted(bucket_mean_scores.keys(),
+                             key=lambda b: bucket_mean_scores[b],
+                             reverse=True)[:top_n]
 
         best_total = 0.0
         graphs_with_truth = 0
@@ -403,14 +476,12 @@ class DiscHashDecoder(Decoder):
             motif_ids = pyg.motif_id.tolist()
             n_nodes = len(motif_ids)
 
+            # bucket rank (index in top_buckets) is the cluster id
             pred_assign = [-1] * n_nodes
-            for p_idx, pat in enumerate(patterns_ranked):
-                for inst in pat['instances']:
-                    if inst['source_idx'] != src_idx:
-                        continue
-                    for node in inst['nodes']:
-                        if pred_assign[node] == -1:
-                            pred_assign[node] = p_idx
+            for b_idx, bucket in enumerate(top_buckets):
+                for node in bucket_nodes_per_src[bucket].get(src_idx, set()):
+                    if pred_assign[node] == -1:
+                        pred_assign[node] = b_idx
 
             true_labels = sorted({m for m in motif_ids if m > 0})
             pred_labels = sorted({p for p in pred_assign if p >= 0})
@@ -425,8 +496,10 @@ class DiscHashDecoder(Decoder):
                 mapping = dict(zip(perm, true_labels[:k]))
                 total = 0.0
                 for p_lab, t_lab in mapping.items():
-                    pred_nodes = {i for i, p in enumerate(pred_assign) if p == p_lab}
-                    true_nodes = {i for i, m in enumerate(motif_ids) if m == t_lab}
+                    pred_nodes = {i for i, p in enumerate(pred_assign)
+                                  if p == p_lab}
+                    true_nodes = {i for i, m in enumerate(motif_ids)
+                                  if m == t_lab}
                     total += self._jaccard(pred_nodes, true_nodes)
                 avg = total / len(mapping)
                 if avg > best_jacc:

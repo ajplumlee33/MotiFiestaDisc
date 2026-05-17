@@ -10,10 +10,10 @@ from MotiFiesta.training.disc_decode import DiscHashDecoder
 
 def main():
     decoder = DiscHashDecoder(
-        model_id='test',
-        dataset_id='mips_torch',
-        dataset_root='data/mips_torch',
-        level=2,
+        model_id='reverse2-clique-d0.0',
+        dataset_id='sys_synth-clique-d0.00',
+        dataset_root='data/sys_synth-clique-d0.00',
+        level=3,
     )
 
     results = decoder.decode()
@@ -24,7 +24,7 @@ def main():
     print("\n=== top motifs ===")
     out = decoder.export_all(
         results,
-        out_dir='decoded/test',
+        out_dir='decoded/reverse2-clique-d0.00',
         top_n=10,
         min_size=3,
         max_size=8,
