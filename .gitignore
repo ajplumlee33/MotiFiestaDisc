@@ -163,7 +163,10 @@ cython_debug/
 .python-version
 css595.ipynb
 #.gitignore
+CLAUDE.md
 /data/
+/decoded/
+/edge/
 data/mips_torch/data.pt
 data/mips.txt
 /models/

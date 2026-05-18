@@ -3,7 +3,7 @@ import os
 import time
 
 import torch
-from torch.nn.utils import clip_grad_norm_
+
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
@@ -39,7 +39,7 @@ class Controller:
             if key not in self.best_losses:
                 continue
             current_best = self.best_losses[key]['best_loss']
-            if math.isnan(current_best) or val < current_best:
+            if val < current_best:
                 self.best_losses[key]['best_loss'] = val
                 self.best_losses[key]['since_best'] = 0
             elif not math.isnan(val):
@@ -79,12 +79,14 @@ def _forward(model, data, device):
     return model(data.x, data.edge_index, b_vec, n_id=n_id)
 
 
-def _make_neg(pos, n_iter=100):
+def _make_neg(pos):
     """
     produce a rewired null from a positive batch via classical double edge swap.
-    preserves the degree sequence.
+    preserves the degree sequence. n_iter scales with graph size to match the
+    original dataset's ~1 swap per directed edge (100 swaps on ~100-edge graphs).
     """
     device = pos.x.device
+    n_iter = max(100, pos.edge_index.size(1))
     neg = rewire(pos.cpu(), n_iter=n_iter)
     return neg.to(device)
 
@@ -110,6 +112,7 @@ def sys_train(model,
                 controller_state=None,
                 rec_kernel='wwl',
                 edge_sample_rate=1.0,
+                max_warmup_epochs=-1,
                 ):
     """sys_train.
 
@@ -126,6 +129,10 @@ def sys_train(model,
     :param max_batches: if not -1, stop after given number of batches
     :param rec_kernel: 'wwl' (original) or 'wl' (vectorized wl subtree kernel)
     :param edge_sample_rate: fraction of (i,j) entries used for rec supervision
+    :param max_warmup_epochs: hard cap on rec-only warmup phase. -1 (default)
+        means use plateau detection only. when set to a positive value, warmup
+        ends at min(plateau, max_warmup_epochs), guaranteeing mot/sil gets at
+        least (epochs - max_warmup_epochs) training epochs.
     """
     start_time = time.time()
     device = get_device()
@@ -177,7 +184,10 @@ def sys_train(model,
             backward = False
             warmup_done = False
 
-            if controller.keep_going('rec') and not hard_embed:
+            warmup_capped = max_warmup_epochs > 0 and epoch >= max_warmup_epochs
+            rec_active = controller.keep_going('rec') and not hard_embed and not warmup_capped
+
+            if rec_active:
                 if rec_kernel == 'wl':
                     rec_loss = model.rec_loss_wl(xx_pos,
                                                  ee_pos,
@@ -197,6 +207,14 @@ def sys_train(model,
                 rec_loss_tot += rec_loss.item()
                 backward = True
                 loss += rec_loss
+
+                if mode in ('sil', 'combined') and controller.keep_going('sil'):
+                    sil_loss = model.sil_loss(internals_pos,
+                                              merge_info_pos['spotlights'],
+                                              sil_tracker,
+                                              momentum=sil_momentum)
+                    loss += sil_loss * lam
+                    sil_loss_tot += sil_loss.item()
             else:
                 warmup_done = True
 
@@ -219,18 +237,8 @@ def sys_train(model,
                     mot_loss_tot += mot_loss.item()
                     backward = True
 
-                if mode in ('sil', 'combined') and controller.keep_going('sil'):
-                    sil_loss = model.sil_loss(internals_pos,
-                                              merge_info_pos['spotlights'],
-                                              sil_tracker,
-                                              momentum=sil_momentum)
-                    loss += sil_loss * lam
-                    sil_loss_tot += sil_loss.item()
-                    backward = True
-
             if backward:
                 loss.backward()
-                clip_grad_norm_(model.parameters(), max_norm=1.0)
                 optimizer.step()
             else:
                 done_training = True
@@ -264,7 +272,10 @@ def sys_train(model,
             mot_loss = torch.tensor(float('nan'))
             sil_loss = torch.tensor(float('nan'))
 
-            if controller.keep_going('rec'):
+            warmup_capped = max_warmup_epochs > 0 and epoch >= max_warmup_epochs
+            rec_active = controller.keep_going('rec') and not warmup_capped
+
+            if rec_active:
                 if rec_kernel == 'wl':
                     rec_loss = model.rec_loss_wl(xx_pos,
                                                  ee_pos,
@@ -280,6 +291,12 @@ def sys_train(model,
                                             source_graph,
                                             internals_pos
                                             )
+
+                if mode in ('sil', 'combined'):
+                    sil_loss = model.sil_loss(internals_pos,
+                                              merge_info_pos['spotlights'],
+                                              sil_tracker,
+                                              momentum=sil_momentum)
             else:
                 warmup_done = True
 
@@ -299,12 +316,6 @@ def sys_train(model,
                                                lam=lam,
                                                beta=beta
                                                )
-
-                if mode in ('sil', 'combined'):
-                    sil_loss = model.sil_loss(internals_pos,
-                                              merge_info_pos['spotlights'],
-                                              sil_tracker,
-                                              momentum=sil_momentum)
 
             rec_loss_tot += rec_loss.item()
             mot_loss_tot += mot_loss.item()

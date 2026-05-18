@@ -213,7 +213,8 @@ class DiscHashDecoder(Decoder):
                                          probas, ee_lookups)
 
                 spotlights.append(spot)
-                scores.append(float(score) if torch.is_tensor(score) else score)
+                n = max(len(spot), 1)
+                scores.append((float(score) if torch.is_tensor(score) else score) / n)
                 hashes.append(h)
 
             results.append({

@@ -44,6 +44,8 @@ if function == 'train':
     parser.add_argument("--epochs", "-e", type=int, default=200)
     parser.add_argument("--stop-epochs", type=int, default=30, help="Number of epochs to train embeddings before doing motifs.")
     parser.add_argument("--attributed", default=False, action='store_true', help="Use attributed graphs. If False, use node degree as features.")
+    parser.add_argument('--max-warmup-epochs', type=int, default=-1,
+                    help='hard cap on rec warmup. -1 = use plateau detection only')
 
     parser.add_argument("--lam",  type=float, default=1)
     parser.add_argument("--beta", type=float, default=1)
@@ -205,5 +207,6 @@ if function == 'train':
                     lam=args.lam,
                     epoch_start=epoch_start,
                     optimizer=optimizer,
-                    controller_state=controller_state
+                    controller_state=controller_state,
+                    max_warmup_epochs=args.max_warmup_epochs
                     )
