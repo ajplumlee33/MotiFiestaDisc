@@ -69,12 +69,14 @@ class EdgePooling(torch.nn.Module):
                  merge_method='sum',
                  add_to_edge_score=0.0,
                  conv_first=False,
+                 parallel_matching=False,
                  ):
         super(EdgePooling, self).__init__()
         self.in_channels = in_channels
         self.out_channels = out_channels
         # self.conv = torch_geometric.nn.GATConv(2 * in_channels, in_channels)
         self.conv_first = conv_first
+        self.parallel_matching = parallel_matching
         if edge_score_method == 'softmax':
             edge_score_method = self.compute_edge_score_softmax
         elif edge_score_method == 'sigmoid':
@@ -186,16 +188,21 @@ class EdgePooling(torch.nn.Module):
         # x_merged_self = self.transform_activate(x_merged_self)
         # x_merged_self = self.transform_2(x_merged_self)
 
-        # compute scores for each edge
-        e = self.score_net(x_merged).view(-1)
+        # compute scores for each edge; relu before score_net gives the
+        # two-layer path non-linearity (transform + score_net alone is linear)
+        e = self.score_net(F.relu(x_merged)).view(-1)
         e = F.dropout(e, p=self.dropout, training=self.training)
         e = self.compute_edge_score(e, edge_index, x.size(0), batch)
 
         if dummy:
             e = torch.full(e.shape, .5, dtype=torch.float32)
 
-        x_new, edge_index, batch, unpool_info = self.__merge_edges__(
-            x, edge_index, batch, e, x_merged, x_merged_self)
+        if self.parallel_matching:
+            x_new, edge_index, batch, unpool_info = self.__merge_edges_parallel__(
+                x, edge_index, batch, e, x_merged, x_merged_self)
+        else:
+            x_new, edge_index, batch, unpool_info = self.__merge_edges__(
+                x, edge_index, batch, e, x_merged, x_merged_self)
 
         return {'new_graph': {'x_new': x_new, 'e_ind_new': edge_index, 'batch_new': batch, 'unpool': unpool_info},
                 'internals': {'x_merged': x_merged, 'x_merged_self': x_merged_self, 'edge_scores': e}
@@ -293,6 +300,173 @@ class EdgePooling(torch.nn.Module):
                                               cluster=cluster, batch=batch,
                                               new_edge_score=new_edge_score,
                                               old_edge_score=edge_score)
+
+        return new_x, new_edge_index, new_batch, unpool_info
+
+    def __merge_edges_parallel__(self, x, edge_index, batch, edge_score,
+                                  x_merged, x_merged_self, max_rounds=20):
+        """gpu-vectorized stochastic maximal matching via luby-style selection.
+
+        each edge passes a random gate proportional to its score, matching the
+        sequential version's `if r > edge_score: continue` semantics. surviving
+        edges enter parallel matching: per round, an edge is selected iff its
+        priority (score plus tiny tiebreaker noise) is the max among alive
+        edges at both its endpoints. converges in roughly o(log n) rounds.
+
+        canonicalization: pyg represents undirected edges as both (u, v) and
+        (v, u) columns. with symmetric merge methods (sum), both directions
+        have identical scores; float-precision noise can fail to distinguish
+        them, causing both to be selected and consuming two supernode ids per
+        undirected edge. we filter to src <= dst before matching so each
+        undirected edge can be selected at most once. the full edge_index is
+        still used to construct the new graph via cluster[edge_index].
+        """
+        device = x.device
+        num_nodes = x.size(0)
+        num_edges = edge_index.size(1)
+
+        if num_edges == 0:
+            cluster = torch.arange(num_nodes, device=device, dtype=torch.long)
+            new_x = x_merged_self
+            new_edge_score = x.new_ones(num_nodes)
+            new_edge_index = torch.zeros(2, 0, dtype=torch.long, device=device)
+            new_batch = batch.clone()
+            unpool_info = self.unpool_description(
+                edge_index=edge_index, cluster=cluster, batch=batch,
+                new_edge_score=new_edge_score, old_edge_score=edge_score,
+            )
+            return new_x, new_edge_index, new_batch, unpool_info
+
+        src_full = edge_index[0]
+        dst_full = edge_index[1]
+
+        edge_key_fwd = src_full * num_nodes + dst_full
+        edge_key_rev = dst_full * num_nodes + src_full
+        is_symmetric = torch.isin(edge_key_rev, edge_key_fwd).all().item()
+
+        if is_symmetric:
+            canon_mask = src_full <= dst_full
+        else:
+            canon_mask = torch.ones(num_edges, dtype=torch.bool, device=device)
+        canon_idx = canon_mask.nonzero(as_tuple=False).squeeze(-1)
+        n_canon = canon_idx.size(0)
+
+        if n_canon == 0:
+            cluster = torch.arange(num_nodes, device=device, dtype=torch.long)
+            new_x = x_merged_self
+            new_edge_score = x.new_ones(num_nodes)
+            new_edge_index, _ = coalesce(cluster[edge_index], None, num_nodes, num_nodes)
+            new_edge_index, _ = remove_self_loops(new_edge_index)
+            new_batch = batch.clone()
+            unpool_info = self.unpool_description(
+                edge_index=edge_index, cluster=cluster, batch=batch,
+                new_edge_score=new_edge_score, old_edge_score=edge_score,
+            )
+            return new_x, new_edge_index, new_batch, unpool_info
+
+        src = src_full[canon_idx]
+        dst = dst_full[canon_idx]
+        canon_score = edge_score[canon_idx]
+
+        random_gate = torch.rand(n_canon, device=device)
+        edges_alive = random_gate < canon_score
+
+        priority = canon_score.double() + 1e-9 * torch.rand(
+            n_canon, dtype=torch.float64, device=device
+        )
+
+        cluster = torch.full((num_nodes,), -1, dtype=torch.long, device=device)
+        nodes_taken = torch.zeros(num_nodes, dtype=torch.bool, device=device)
+
+        selected_per_round = []
+        next_id = 0
+
+        for _ in range(max_rounds):
+            if not edges_alive.any():
+                break
+
+            masked_priority = torch.where(
+                edges_alive, priority,
+                torch.full_like(priority, float('-inf'), dtype=torch.float64)
+            )
+
+            node_max = torch.full((num_nodes,), float('-inf'),
+                                  dtype=torch.float64, device=device)
+            node_max.scatter_reduce_(0, src, masked_priority,
+                                     reduce='amax', include_self=True)
+            node_max.scatter_reduce_(0, dst, masked_priority,
+                                     reduce='amax', include_self=True)
+
+            selected = (
+                edges_alive
+                & (masked_priority == node_max[src])
+                & (masked_priority == node_max[dst])
+                & (~nodes_taken[src])
+                & (~nodes_taken[dst])
+            )
+
+            if not selected.any():
+                break
+
+            sel_local = selected.nonzero(as_tuple=False).squeeze(-1)
+            n_new = sel_local.size(0)
+            new_ids = torch.arange(next_id, next_id + n_new, device=device)
+            next_id += n_new
+
+            sel_src = src[sel_local]
+            sel_dst = dst[sel_local]
+
+            cluster[sel_src] = new_ids
+            cluster[sel_dst] = new_ids
+
+            nodes_taken[sel_src] = True
+            nodes_taken[sel_dst] = True
+
+            edges_alive = edges_alive & (~nodes_taken[src]) & (~nodes_taken[dst])
+            selected_per_round.append(canon_idx[sel_local])
+
+        untaken = (~nodes_taken).nonzero(as_tuple=False).squeeze(-1)
+        n_singletons = untaken.size(0)
+        if n_singletons > 0:
+            singleton_ids = torch.arange(next_id, next_id + n_singletons, device=device)
+            cluster[untaken] = singleton_ids
+            next_id += n_singletons
+
+        total_nodes = next_id
+
+        if selected_per_round:
+            merged_idx_all = torch.cat(selected_per_round)
+            merged_embeddings = x_merged[merged_idx_all]
+        else:
+            merged_idx_all = torch.empty(0, dtype=torch.long, device=device)
+            merged_embeddings = torch.empty(0, x_merged.size(1), device=device)
+
+        if n_singletons > 0:
+            singleton_embeddings = x_merged_self[untaken]
+        else:
+            singleton_embeddings = torch.empty(0, x_merged_self.size(1), device=device)
+
+        new_x = torch.cat([merged_embeddings, singleton_embeddings], dim=0)
+
+        if merged_idx_all.numel() > 0:
+            merged_scores = edge_score[merged_idx_all]
+        else:
+            merged_scores = torch.empty(0, device=device)
+        singleton_scores = (x.new_ones(n_singletons) if n_singletons > 0
+                            else torch.empty(0, device=device))
+        new_edge_score = torch.cat([merged_scores, singleton_scores])
+
+        N = total_nodes
+        new_edge_index, _ = coalesce(cluster[edge_index], None, N, N)
+        new_edge_index, _ = remove_self_loops(new_edge_index)
+
+        new_batch = torch.empty(N, dtype=torch.long, device=device)
+        new_batch.scatter_(0, cluster, batch)
+
+        unpool_info = self.unpool_description(
+            edge_index=edge_index, cluster=cluster, batch=batch,
+            new_edge_score=new_edge_score, old_edge_score=edge_score,
+        )
 
         return new_x, new_edge_index, new_batch, unpool_info
 

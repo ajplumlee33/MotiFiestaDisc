@@ -28,8 +28,10 @@ class Controller:
         else:  # combined
             self.modules = ['rec', 'mot', 'sil']
 
-        self.best_losses = {key: {'best_loss': float('nan'), 'since_best': 0}
-                            for key in self.modules}
+        self.best_losses = {
+            key: {'best_loss': float('nan') if key == 'rec' else float('inf'), 'since_best': 0}
+            for key in self.modules
+        }
 
     def keep_going(self, key):
         return self.best_losses[key]['since_best'] <= self.since_best_threshold
@@ -82,11 +84,12 @@ def _forward(model, data, device):
 def _make_neg(pos):
     """
     produce a rewired null from a positive batch via classical double edge swap.
-    preserves the degree sequence. n_iter scales with graph size to match the
-    original dataset's ~1 swap per directed edge (100 swaps on ~100-edge graphs).
+    preserves the degree sequence. n_iter scales with undirected edge count,
+    capped at 5000 to prevent O(E²) blowup on dense batches from large graphs.
     """
     device = pos.x.device
-    n_iter = max(100, pos.edge_index.size(1))
+    n_edges_undirected = pos.edge_index.size(1) // 2
+    n_iter = max(100, min(n_edges_undirected * 2, 5000))
     neg = rewire(pos.cpu(), n_iter=n_iter)
     return neg.to(device)
 
@@ -112,7 +115,6 @@ def sys_train(model,
                 controller_state=None,
                 rec_kernel='wwl',
                 edge_sample_rate=1.0,
-                max_warmup_epochs=-1,
                 ):
     """sys_train.
 
@@ -129,10 +131,6 @@ def sys_train(model,
     :param max_batches: if not -1, stop after given number of batches
     :param rec_kernel: 'wwl' (original) or 'wl' (vectorized wl subtree kernel)
     :param edge_sample_rate: fraction of (i,j) entries used for rec supervision
-    :param max_warmup_epochs: hard cap on rec-only warmup phase. -1 (default)
-        means use plateau detection only. when set to a positive value, warmup
-        ends at min(plateau, max_warmup_epochs), guaranteeing mot/sil gets at
-        least (epochs - max_warmup_epochs) training epochs.
     """
     start_time = time.time()
     device = get_device()
@@ -184,10 +182,7 @@ def sys_train(model,
             backward = False
             warmup_done = False
 
-            warmup_capped = max_warmup_epochs > 0 and epoch >= max_warmup_epochs
-            rec_active = controller.keep_going('rec') and not hard_embed and not warmup_capped
-
-            if rec_active:
+            if controller.keep_going('rec') and not hard_embed:
                 if rec_kernel == 'wl':
                     rec_loss = model.rec_loss_wl(xx_pos,
                                                  ee_pos,
@@ -207,14 +202,6 @@ def sys_train(model,
                 rec_loss_tot += rec_loss.item()
                 backward = True
                 loss += rec_loss
-
-                if mode in ('sil', 'combined') and controller.keep_going('sil'):
-                    sil_loss = model.sil_loss(internals_pos,
-                                              merge_info_pos['spotlights'],
-                                              sil_tracker,
-                                              momentum=sil_momentum)
-                    loss += sil_loss * lam
-                    sil_loss_tot += sil_loss.item()
             else:
                 warmup_done = True
 
@@ -235,6 +222,15 @@ def sys_train(model,
                                                )
                     loss += mot_loss
                     mot_loss_tot += mot_loss.item()
+                    backward = True
+
+                if mode in ('sil', 'combined') and controller.keep_going('mot') and controller.keep_going('sil'):
+                    sil_loss = model.sil_loss(internals_pos,
+                                              merge_info_pos['spotlights'],
+                                              sil_tracker,
+                                              momentum=sil_momentum)
+                    loss += sil_loss * lam
+                    sil_loss_tot += sil_loss.item()
                     backward = True
 
             if backward:
@@ -272,10 +268,7 @@ def sys_train(model,
             mot_loss = torch.tensor(float('nan'))
             sil_loss = torch.tensor(float('nan'))
 
-            warmup_capped = max_warmup_epochs > 0 and epoch >= max_warmup_epochs
-            rec_active = controller.keep_going('rec') and not warmup_capped
-
-            if rec_active:
+            if controller.keep_going('rec'):
                 if rec_kernel == 'wl':
                     rec_loss = model.rec_loss_wl(xx_pos,
                                                  ee_pos,
@@ -292,16 +285,11 @@ def sys_train(model,
                                             internals_pos
                                             )
 
-                if mode in ('sil', 'combined'):
-                    sil_loss = model.sil_loss(internals_pos,
-                                              merge_info_pos['spotlights'],
-                                              sil_tracker,
-                                              momentum=sil_momentum)
             else:
                 warmup_done = True
 
             if warmup_done:
-                if mode in ('mot', 'combined'):
+                if mode in ('mot', 'combined') and controller.keep_going('mot'):
                     neg = _make_neg(pos)
                     with torch.no_grad():
                         xx_neg, pp_neg, ee_neg, _, merge_info_neg, internals_neg = _forward(model, neg, device)
@@ -316,6 +304,12 @@ def sys_train(model,
                                                lam=lam,
                                                beta=beta
                                                )
+
+                if mode in ('sil', 'combined') and controller.keep_going('mot') and controller.keep_going('sil'):
+                    sil_loss = model.sil_loss(internals_pos,
+                                              merge_info_pos['spotlights'],
+                                              sil_tracker,
+                                              momentum=sil_momentum)
 
             rec_loss_tot += rec_loss.item()
             mot_loss_tot += mot_loss.item()

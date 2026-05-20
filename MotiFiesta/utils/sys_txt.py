@@ -26,8 +26,10 @@ def rewire(g_pyg, n_iter=100):
     else:
         g_nx = to_networkx(g_pyg)
     rewired_g = g_nx.copy()
+    # cache once — list(g_nx.edges()) inside the loop is O(E) per iteration
+    edge_list = list(g_nx.edges())
     for n in range(n_iter):
-        e1, e2 = random.sample(list(g_nx.edges()), 2)
+        e1, e2 = random.sample(edge_list, 2)
         rewired_g.remove_edges_from([e1, e2])
         rewired_g.add_edges_from([(e1[0], e2[1]), (e1[1], e2[0])])
 

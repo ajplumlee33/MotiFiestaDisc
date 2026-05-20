@@ -10,11 +10,15 @@ from MotiFiesta.training.disc_decode import DiscHashDecoder
 
 def main():
     decoder = DiscHashDecoder(
-        model_id='mot-clique-d0.00',
-        dataset_id='sys_synth-clique-d0.00',
-        dataset_root='data/sys_synth-clique-d0.00',
+        model_id='sys_synth-clique-com2-p0.1-n1000-d0.00',
+        dataset_id='sys_synth-clique-p0.1-n1000-d0.00',
+        dataset_root='data/sys_synth-clique-p0.1-n1000-d0.00',
         level=3,
+        hash_dim=4
     )
+
+    for layer in decoder.model.layers:
+        layer.parallel_matching = True
 
     results = decoder.decode()
 
@@ -24,7 +28,7 @@ def main():
     print("\n=== top motifs ===")
     out = decoder.export_all(
         results,
-        out_dir='decoded/mot-clique-d0.00',
+        out_dir='decoded/sys_synth-clique-com2-p0.1-n1000-d0.00',
         top_n=10,
         min_size=3,
         max_size=8,
@@ -36,8 +40,6 @@ def main():
     print(f"\ncollection file : {out['collection']}")
     print(f"input graph     : {out['input_graph']}")
     print(f"queries file    : {out['queries']}")
-    if out['eval_file']:
-        print(f"eval file       : {out['eval_file']}")
 
 
 if __name__ == "__main__":

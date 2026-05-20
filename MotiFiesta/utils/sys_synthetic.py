@@ -21,7 +21,7 @@ from igraph import Graph
 from torch_geometric.data import Dataset
 from torch_geometric.utils import from_networkx
 
-from MotiFiesta.utils.synthetic import motif_embed, generate_parent_erdos
+from MotiFiesta.utils.synthetic import motif_distort
 
 
 class SysSyntheticDataset(Dataset):
@@ -147,8 +147,6 @@ class SysSyntheticDataset(Dataset):
         }
 
     def process(self):
-        # determinism. motif_embed/motif_distort use `random` internally,
-        # and generate_parent_erdos uses np.random via networkx.
         random.seed(self.seed)
         np.random.seed(self.seed)
 
@@ -170,58 +168,70 @@ class SysSyntheticDataset(Dataset):
                 f"types {len(self.motif_types)}) to leave room for anchor nodes"
             )
 
-        # build the {dict_key: nx.graph} for motif_embed. dict keys must be
-        # unique, but per-instance motif_ids are remapped to type ids below
-        # (instances of motif_types[k] -> motif_id k+1) so motif_id encodes
-        # type, matching the original synthetic.py convention.
-        templates = {mt: menu[mt]() for mt in self.motif_types}
-        motifs_to_embed = {}
-        key_to_type_id = {}
-        next_key = 1
+        # build parent ER graph directly — no max_degree retry loop
+        G = nx.erdos_renyi_graph(self.parent_size, self.parent_e_prob,
+                                 seed=self.seed)
+        if not nx.is_connected(G):
+            comps = list(nx.connected_components(G))
+            rep = next(iter(comps[0]))
+            for comp in comps[1:]:
+                G.add_edge(rep, next(iter(comp)))
+
+        nx.set_node_attributes(G, 0, 'is_motif')
+        nx.set_node_attributes(G, 0, 'motif_id')
+
+        anchor_nodes = random.sample(sorted(G.nodes()), total_instances)
+
+        # motif nodes get IDs starting at parent_size — no full-graph relabeling
+        next_id = self.parent_size
+        inst = 0
         for type_idx, mt in enumerate(self.motif_types, start=1):
-            template = templates[mt]
+            template = menu[mt]()
+            for n in template.nodes():
+                template.nodes[n]['class'] = random.randint(0, 1)
+
             for _ in range(self.n_motifs):
-                motifs_to_embed[next_key] = template.copy()
-                key_to_type_id[next_key] = type_idx
-                next_key += 1
+                motif = motif_distort(template.copy(),
+                                      list(template.nodes()),
+                                      p=self.distort_p)
 
-        # motif_distort (called inside motif_embed) reads node['class']
-        for m in motifs_to_embed.values():
-            for n in m.nodes():
-                m.nodes[n]['class'] = random.randint(0, 1)
+                anchor = anchor_nodes[inst]
+                G.remove_node(anchor)
 
-        # -- embed. returns (embedded, original, randomized) ------------------
-        # randomized/original are discarded;
-        # they're useful for the many-small-graphs use case, not this one.
-        embedded, _, _ = motif_embed(
-            motifs_to_embed,
-            parent_size=self.parent_size,
-            parent_e_prob=self.parent_e_prob,
-            distort_p=self.distort_p,
-            embed_prob=1.0,
-            n_classes=2,
-        )
+                motif_size = len(motif)
+                motif_ids = list(range(next_id, next_id + motif_size))
+                mapping = {old: new for old, new
+                           in zip(sorted(motif.nodes()), motif_ids)}
+                motif = nx.relabel_nodes(motif, mapping)
 
-        # remap raw per-instance motif_ids to type ids in [1..K]
-        for n in embedded.nodes():
-            raw_mid = embedded.nodes[n].get('motif_id', 0)
-            if raw_mid > 0:
-                embedded.nodes[n]['motif_id'] = key_to_type_id[raw_mid]
+                for n in motif_ids:
+                    G.add_node(n, is_motif=1, motif_id=type_idx)
+                G.add_edges_from(motif.edges())
 
-        # strip node attrs so pyg doesn't pick up as separate tensors.
-        # leaves `is_motif` and `motif_id` as the only per-node attrs.
-        for n in embedded.nodes():
-            for attr in ('class', 'deg'):
-                embedded.nodes[n].pop(attr, None)
+                # link motif to parent (same logic as original motif_embed)
+                link_motif = [n for n in motif_ids
+                              if random.random() < self.parent_e_prob]
+                link_parent = [n for n in G.nodes()
+                               if G.nodes[n]['is_motif'] == 0
+                               and random.random() < self.parent_e_prob]
+                G.add_edges_from(zip(link_parent, link_motif))
+
+                next_id += motif_size
+                inst += 1
+
+        # normalize node IDs to 0..N-1 and strip non-essential attrs
+        G = nx.convert_node_labels_to_integers(G)
+        for n in G.nodes():
+            G.nodes[n].pop('class', None)
 
         # -- convert to pyg --------------------------------------------------
-        data = from_networkx(embedded)
+        data = from_networkx(G)
 
         # onehotdegree features to match sys_txt's pattern.
         if self.max_degree is not None:
             max_deg = int(self.max_degree)
         else:
-            max_deg = int(max(dict(embedded.degree()).values()))
+            max_deg = int(max(dict(G.degree()).values()))
         data = T.OneHotDegree(max_deg)(data)
 
         # dtype hygiene — decoder expects long tensors for ground truth

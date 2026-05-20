@@ -40,7 +40,8 @@ class MotiFiestaModel(torch.nn.Module):
                  pool_dummy=None,
                  merge_method='sum',
                  global_pool=global_add_pool,
-                 edge_score_method='sigmoid'
+                 edge_score_method='sigmoid',
+                 parallel_matching=False,
                  ):
         super(MotiFiestaModel, self).__init__()
 
@@ -52,6 +53,7 @@ class MotiFiestaModel(torch.nn.Module):
         self.edge_score_method = edge_score_method
         self.merge_method = merge_method
         self.hard_embed = hard_embed
+        self.parallel_matching = parallel_matching
 
         self.layers = self.build_layers()
 
@@ -60,13 +62,15 @@ class MotiFiestaModel(torch.nn.Module):
         layers.append(EdgePooling(self.n_features,
                                   self.hidden_dim,
                                   edge_score_method=self.edge_score_method,
-                                  merge_method=self.merge_method
+                                  merge_method=self.merge_method,
+                                  parallel_matching=self.parallel_matching,
                                   ))
         for s in range(self.steps):
             layers.append(EdgePooling(self.hidden_dim,
                                       self.hidden_dim,
                                       edge_score_method=self.edge_score_method,
-                                      merge_method=self.merge_method
+                                      merge_method=self.merge_method,
+                                      parallel_matching=self.parallel_matching,
                                       )
                           )
 
@@ -193,6 +197,7 @@ class MotiFiestaModel(torch.nn.Module):
                     num_nodes=20,
                     edge_sample_rate=1.0,
                     wl_iter=3,
+                    max_spotlight_nodes=20,
                     ):
         """reconstruction loss using wl subtree kernel, vectorized.
 
@@ -236,6 +241,10 @@ class MotiFiestaModel(torch.nn.Module):
                 spot_global_ids = target_spotlights.get(spot_idx)
                 if not spot_global_ids:
                     continue
+                # cap spotlight size to bound wl kernel cost on dense graphs
+                if len(spot_global_ids) > max_spotlight_nodes:
+                    import random as _rnd
+                    spot_global_ids = set(_rnd.sample(sorted(spot_global_ids), max_spotlight_nodes))
                 node_idx = torch.tensor(
                     sorted(spot_global_ids), dtype=torch.long, device=device
                 )
@@ -283,14 +292,15 @@ class MotiFiestaModel(torch.nn.Module):
         return torch.exp(f)
 
     @staticmethod
-    def distance_density(X, X_ref, k=20):
-        """ Returns distance to kth nearest neighbor in batch """
-        d = X.shape[1]
-        N = X_ref.shape[0]
-        knn = KDTree(X_ref.cpu().detach().numpy())
-        R,_ = knn.query(X.cpu().detach().numpy(), k=k)
-        R = R[:,k-1]
-        return torch.tensor(R, dtype=torch.float32, requires_grad=False)
+    def distance_density(X, X_ref, k=20, max_ref=2000):
+        """distance to k-th nearest neighbor in X_ref for each row of X."""
+        with torch.no_grad():
+            if X_ref.size(0) > max_ref:
+                sample = torch.randperm(X_ref.size(0), device=X_ref.device)[:max_ref]
+                X_ref = X_ref[sample]
+            dists = torch.cdist(X, X_ref)
+            knn_dists, _ = dists.topk(k, dim=1, largest=False)
+            return knn_dists[:, k - 1]
 
     @staticmethod
     def knn_density(X, X_ref, volume=False, epsilon=1e-5, k=50):
@@ -370,20 +380,21 @@ class MotiFiestaModel(torch.nn.Module):
         tot_loss /= steps
         return tot_loss
 
-    def sil_loss(self, internals_pos, spotlights, tracker, momentum=0.95):
-        """
-        sampling invariance loss.
-
-        neighborhood sampling exposes each node to varying local contexts across
-        batches. a real motif instance should look the same regardless of which
-        neighborhood it was sampled within. this loss tracks a momentum-updated
-        target embedding for every (source_node, level) pair and penalises
-        deviations of the current batch's embedding from the target.
+    def sil_loss(self, internals_pos, spotlights, tracker, momentum=0.95,
+                 max_per_level=100):
+        """sampling invariance loss.
 
         :param internals_pos: per-level internals returned by the forward pass
         :param spotlights: merge_info['spotlights'] for the current batch
         :param tracker: SamplingInvarianceTracker storing the targets
         :param momentum: smoothing factor for the target update (0.95 default)
+        :param max_per_level: cap on supernodes processed per level per batch
+
+        keys the tracker by individual original global node IDs rather than the
+        merged spotlight tuple. the tuple changes every run due to stochastic
+        edge pooling; individual node IDs are invariant to the pooling outcome.
+        for each supernode, every original node it contains gets its own ema
+        target, and the loss is the average cosine distance across those targets.
         """
         device = get_device()
         tot_loss = torch.zeros(1, device=device)
@@ -394,31 +405,38 @@ class MotiFiestaModel(torch.nn.Module):
             if x_level.size(0) == 0:
                 continue
 
-            # normalize to compare direction rather than magnitude
             h_cur = F.normalize(x_level, dim=-1)
 
-            # each supernode at this level represents one spotlight; we anchor the
-            # target to the sorted spotlight tuple so it is stable across batches
-            for node_idx in range(x_level.size(0)):
+            n_valid = x_level.size(0)
+            if n_valid > max_per_level:
+                perm = torch.randperm(n_valid, device=device)[:max_per_level]
+                indices = perm.tolist()
+            else:
+                indices = range(n_valid)
+
+            for node_idx in indices:
                 spot = spotlights[level].get(node_idx)
                 if not spot:
                     continue
-                key = tuple(sorted(spot))
 
-                target = tracker.get(key, level)
-                if target is None:
-                    # first sighting: seed the target with the current embedding
-                    tracker.set(key, level, h_cur[node_idx].detach())
-                    continue
+                h_i = h_cur[node_idx]
+                node_loss = torch.zeros(1, device=device)
+                k = 0
 
-                target = target.to(device)
-                tot_loss = tot_loss + (1.0 - (h_cur[node_idx] * target).sum())
-                n_terms += 1
+                for g in spot:
+                    target = tracker.get(g, level)
+                    if target is None:
+                        tracker.set(g, level, h_i.detach())
+                        continue
+                    target = target.to(device)
+                    node_loss = node_loss + (1.0 - (h_i * target).sum())
+                    k += 1
+                    new_t = momentum * target + (1.0 - momentum) * h_i.detach()
+                    tracker.set(g, level, F.normalize(new_t, dim=-1))
 
-                # ema update of the target; detach to keep it out of the graph
-                new_target = momentum * target + (1.0 - momentum) * h_cur[node_idx].detach()
-                new_target = F.normalize(new_target, dim=-1)
-                tracker.set(key, level, new_target)
+                if k > 0:
+                    tot_loss = tot_loss + node_loss / k
+                    n_terms += 1
 
         if n_terms == 0:
             return torch.zeros(1, device=device).squeeze()

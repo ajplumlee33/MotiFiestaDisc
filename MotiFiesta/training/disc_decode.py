@@ -213,8 +213,7 @@ class DiscHashDecoder(Decoder):
                                          probas, ee_lookups)
 
                 spotlights.append(spot)
-                n = max(len(spot), 1)
-                scores.append((float(score) if torch.is_tensor(score) else score) / n)
+                scores.append(float(score) if torch.is_tensor(score) else score)
                 hashes.append(h)
 
             results.append({
@@ -408,25 +407,14 @@ class DiscHashDecoder(Decoder):
         embedded_g6s = self._embedded_g6s(results)
         predicted_g6s = {p['label'] for p in patterns_ranked}
 
-        if predicted_g6s and embedded_g6s:
-            hit_labels = predicted_g6s & embedded_g6s
-            precision = len(hit_labels) / len(predicted_g6s)
-            recall = len(hit_labels) / len(embedded_g6s)
-        else:
-            hit_labels = set()
-            precision = 0.0
-            recall = 0.0
+        hit_labels = predicted_g6s & embedded_g6s if predicted_g6s and embedded_g6s else set()
 
-        # primary metric: lsh-bucket m-jaccard (paper methodology)
         lsh_jaccard = self._lsh_permutation_jaccard(
             results, top_n=len(patterns_ranked))
 
         return {
             'embedded_g6s': sorted(embedded_g6s),
-            'predicted_g6s': sorted(predicted_g6s),
             'hit_labels': sorted(hit_labels),
-            'pattern_precision': precision,
-            'pattern_recall': recall,
             'jaccard': lsh_jaccard,
         }
 
@@ -492,7 +480,8 @@ class DiscHashDecoder(Decoder):
             graphs_with_truth += 1
 
             best_jacc = 0.0
-            k = min(len(pred_labels), len(true_labels))
+            K = len(true_labels)
+            k = min(len(pred_labels), K)
             for perm in permutations(pred_labels, k):
                 mapping = dict(zip(perm, true_labels[:k]))
                 total = 0.0
@@ -502,7 +491,7 @@ class DiscHashDecoder(Decoder):
                     true_nodes = {i for i, m in enumerate(motif_ids)
                                   if m == t_lab}
                     total += self._jaccard(pred_nodes, true_nodes)
-                avg = total / len(mapping)
+                avg = total / K  # paper eq. 1: average over K true motif types
                 if avg > best_jacc:
                     best_jacc = avg
             best_total += best_jacc
@@ -576,17 +565,6 @@ class DiscHashDecoder(Decoder):
                 row += "  yes" if pat['label'] in embedded_g6s else "  no"
             print(row)
 
-    def export_eval(self, eval_metrics, out_path):
-        """ write the eval metrics dict as a small text summary. """
-        if not eval_metrics:
-            return None
-        with open(out_path, 'w') as f:
-            for key, val in eval_metrics.items():
-                if isinstance(val, (list, set, tuple)):
-                    val = ', '.join(map(str, val))
-                f.write(f"{key}: {val}\n")
-        return out_path
-
     def export_all(self,
                    results,
                    out_dir,
@@ -619,11 +597,15 @@ class DiscHashDecoder(Decoder):
             ranked, os.path.join(out_dir, 'motifiesta_collection.txt'))
         input_path, queries_path = self.export_nemomap_inputs(
             ranked, results, out_dir)
-        eval_path = (self.export_eval(eval_metrics,
-                                      os.path.join(out_dir, 'eval.txt'))
-                     if eval_metrics else None)
 
         self.print_stats(ranked, eval_metrics=eval_metrics)
+
+        if eval_metrics:
+            predicted_g6s = sorted({p['label'] for p in ranked})
+            print(f"\nm-jaccard:     {eval_metrics['jaccard']:.4f}")
+            print(f"embedded g6s:  {', '.join(eval_metrics['embedded_g6s'])}")
+            print(f"predicted g6s: {', '.join(predicted_g6s)}")
+            print(f"hit labels:    {', '.join(eval_metrics['hit_labels']) or 'none'}")
 
         return {
             'patterns': ranked,
@@ -631,7 +613,6 @@ class DiscHashDecoder(Decoder):
             'collection': collection_path,
             'input_graph': input_path,
             'queries': queries_path,
-            'eval_file': eval_path,
         }
 
 
@@ -650,16 +631,6 @@ if __name__ == "__main__":
     print(f"input graph: {out['input_graph']}")
     print(f"queries: {len(out['queries'])}")
     print(f"stats: {out['stats']}")
-
-    if out['eval']:
-        ev = out['eval']
-        print("\neval:")
-        print(f"  pattern precision: {ev['pattern_precision']:.3f}")
-        print(f"  pattern recall:    {ev['pattern_recall']:.3f}")
-        print(f"  jaccard:           {ev['jaccard']:.3f}")
-        print(f"  embedded g6s:       {ev['embedded_g6s']}")
-        print(f"  predicted g6s:     {ev['predicted_g6s']}")
-        print(f"  hit labels:        {ev['hit_labels']}")
 
     print("\ntop motifs:")
     for rank, pat in enumerate(out['patterns'], start=1):

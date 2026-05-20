@@ -36,6 +36,10 @@ for density in [.10, .20, .33]:
     for d in [0, .01, .02, .05, .1, .2]:
         SysSyntheticDataset(root=f'data/sys_synth-dens{density:.2f}-d{d:.2f}', seed=42, motif_type='clique', motif_size=10, n_motifs=int(round(density * 4000 / 10)), parent_size=4000, parent_e_prob=0.0017, distort_p=d)
 
+# Paper-scale clique baseline (motif_size=5, matches size sweep density)
+print(">>> PAPER-SCALE CLIQUE")
+SysSyntheticDataset(root='data/sys_synth-clique-n400-p4000-d0.00', seed=42, motif_type='clique', motif_size=5, n_motifs=400, parent_size=4000, parent_e_prob=0.0017, distort_p=0.0)
+
 # Multi-motif
 print(">>> MULTI MOTIF")
 for types in [['clique', 'star', 'barbell'], ['clique', 'star', 'barbell', 'wheel', 'random']]:
