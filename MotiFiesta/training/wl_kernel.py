@@ -163,6 +163,9 @@ def _wl_relabel_union(labels, edge_index, num_nodes, n_labels):
             dim_size=num_nodes, reduce='sum',
         )
         signature = torch.cat([labels.unsqueeze(1), neighbor_hist], dim=1)
+    if signature.device.type == 'mps':
+        _, new_labels = torch.unique(signature.cpu(), dim=0, return_inverse=True)
+        return new_labels.to(signature.device)
     _, new_labels = torch.unique(signature, dim=0, return_inverse=True)
     return new_labels
 

@@ -20,7 +20,7 @@ class Decoder:
         print(self.model)
 
         root = dataset_root if dataset_root is not None else dataset_id
-        self.dataset = get_loader(root=root, name=dataset_id, max_degree=18)
+        self.dataset = get_loader(root=root, name=dataset_id)
         pass
 
     def decode(self):
@@ -67,37 +67,37 @@ class DiscHashDecoder(Decoder):
     # ------------------------------------------------------------------
 
     @staticmethod
-    def total_sigma(level, node, tree, sigmas, ee):
+    def total_sigma(level, node, cluster_chain, sigmas, ee):
         """recursively sum edge scores along the contraction path.
 
         children of `node` at `level` are the level-(level-1) supernodes
-        in tree[level][node].
+        whose entry in cluster_chain[level-1] equals `node`.
         """
         if level == 0:
             return 0
 
-        children = list(tree[level][node])
+        cluster = cluster_chain[level - 1]
+        children = (cluster == node).nonzero(as_tuple=False).squeeze(-1).tolist()
 
         if len(children) == 0:
             # orphan supernode with no predecessor — contribute nothing
             return 0
 
         if len(children) < 2:
-            return DiscHashDecoder.total_sigma(level - 1, children[0], tree, sigmas, ee)
+            return DiscHashDecoder.total_sigma(level - 1, children[0], cluster_chain, sigmas, ee)
 
         c0, c1 = children[0], children[1]
-        edge_lookups = ee
-        e_idx = edge_lookups[level-1].get(tuple(sorted((c0, c1))))
+        e_idx = ee[level-1].get(tuple(sorted((c0, c1))))
 
         if e_idx is None:
-            return DiscHashDecoder.total_sigma(level-1, c0, tree, sigmas, ee) +\
-                   DiscHashDecoder.total_sigma(level-1, c1, tree, sigmas, ee)
+            return DiscHashDecoder.total_sigma(level-1, c0, cluster_chain, sigmas, ee) +\
+                   DiscHashDecoder.total_sigma(level-1, c1, cluster_chain, sigmas, ee)
 
         current_score = sigmas[level-1][e_idx]
 
         return current_score +\
-               DiscHashDecoder.total_sigma(level-1, c0, tree, sigmas, ee) +\
-               DiscHashDecoder.total_sigma(level-1, c1, tree, sigmas, ee)
+               DiscHashDecoder.total_sigma(level-1, c0, cluster_chain, sigmas, ee) +\
+               DiscHashDecoder.total_sigma(level-1, c1, cluster_chain, sigmas, ee)
 
     def _induced_subgraph(self, source_nx, spotlight):
         """
@@ -184,15 +184,16 @@ class DiscHashDecoder(Decoder):
 
             source_nx = to_networkx(g, to_undirected=True)
 
-            # pull the dict-based merge_info fields
-            spotlights_all = merge_info['spotlights']  # dict[level][supernode_id] = set of global node ids
-            tree = merge_info['tree']                  # dict[level][supernode_id] = set of child supernode ids
+            # pull the tensor-based merge_info fields
+            spot_assign = merge_info['spotlight_assignment']
+            cluster_chain = merge_info['cluster_chain']
+            n_id = merge_info['n_id']
+
+            spot_at_level = spot_assign[self.level]
 
             spotlights = []
             scores = []
             hashes = []
-
-            spot_at_level = spotlights_all[self.level]
 
             # center embeddings before hashing. random-hyperplane lsh
             # measures angular similarity from the origin, so if all
@@ -206,10 +207,12 @@ class DiscHashDecoder(Decoder):
             for i, x in enumerate(level_emb):
                 h = hash_table.index(level_emb_centered[i].detach().numpy())[0]
 
-                # spotlight is already a set of global node ids
-                spot = set(spot_at_level.get(i, set()))
+                # get global node ids in the spotlight of supernode i at self.level
+                mask = spot_at_level == i
+                local_members = mask.nonzero(as_tuple=False).squeeze(-1)
+                spot = set(n_id[local_members].tolist())
 
-                score = self.total_sigma(self.level, i, tree,
+                score = self.total_sigma(self.level, i, cluster_chain,
                                          probas, ee_lookups)
 
                 spotlights.append(spot)
@@ -390,7 +393,7 @@ class DiscHashDecoder(Decoder):
         union = len(a | b)
         return inter / union if union else 0.0
 
-    def evaluate(self, results, patterns_ranked):
+    def evaluate(self, results, patterns_ranked, min_size, max_size):
         """
         type-level evaluation against embedded ground truth.
 
@@ -410,7 +413,8 @@ class DiscHashDecoder(Decoder):
         hit_labels = predicted_g6s & embedded_g6s if predicted_g6s and embedded_g6s else set()
 
         lsh_jaccard = self._lsh_permutation_jaccard(
-            results, top_n=len(patterns_ranked))
+            results, top_n=len(patterns_ranked),
+            min_size=min_size, max_size=max_size)
 
         return {
             'embedded_g6s': sorted(embedded_g6s),
@@ -418,8 +422,7 @@ class DiscHashDecoder(Decoder):
             'jaccard': lsh_jaccard,
         }
 
-    def _lsh_permutation_jaccard(self, results, top_n=10,
-                                  min_size=3, max_size=8):
+    def _lsh_permutation_jaccard(self, results, top_n, min_size, max_size):
         """
         lsh-bucket m-jaccard, matching the paper's decoding methodology
         (algorithm 2). spotlights are grouped by their lsh hash bucket,
@@ -591,7 +594,8 @@ class DiscHashDecoder(Decoder):
                                          min_instances=min_instances)
         ranked = self.rank_patterns(patterns, top_n=top_n, by=rank_by)
 
-        eval_metrics = self.evaluate(results, ranked)
+        eval_metrics = self.evaluate(results, ranked,
+                                      min_size=min_size, max_size=max_size)
 
         collection_path = self.export_nemocollection(
             ranked, os.path.join(out_dir, 'motifiesta_collection.txt'))

@@ -133,13 +133,15 @@ def sys_train(model,
     :param edge_sample_rate: fraction of (i,j) entries used for rec supervision
     """
     start_time = time.time()
-    device = get_device()
+    n_feat = source_graph.num_features if hasattr(source_graph, 'num_features') else None
+    device = get_device(n_features=n_feat)
 
     # fix the rng trajectory so runs are reproducible
     torch.manual_seed(0)
 
     os.makedirs(f'models/{model_name}', exist_ok=True)
     writer = SummaryWriter(f"logs/{model_name}")
+    log_file = open(f"logs/{model_name}/train.log", "a")
 
     if controller_state is None:
         controller = Controller(since_best_threshold=stop_epochs, mode=mode)
@@ -186,7 +188,7 @@ def sys_train(model,
                 if rec_kernel == 'wl':
                     rec_loss = model.rec_loss_wl(xx_pos,
                                                  ee_pos,
-                                                 merge_info_pos['spotlights'],
+                                                 merge_info_pos,
                                                  source_graph,
                                                  internals_pos,
                                                  edge_sample_rate=edge_sample_rate,
@@ -194,7 +196,7 @@ def sys_train(model,
                 else:
                     rec_loss = model.rec_loss(xx_pos,
                                               ee_pos,
-                                              merge_info_pos['spotlights'],
+                                              merge_info_pos,
                                               source_graph,
                                               internals_pos,
                                               draw=False
@@ -208,7 +210,8 @@ def sys_train(model,
             if warmup_done:
                 if mode in ('mot', 'combined') and controller.keep_going('mot'):
                     neg = _make_neg(pos)
-                    xx_neg, pp_neg, ee_neg, _, merge_info_neg, internals_neg = _forward(model, neg, device)
+                    with torch.no_grad():
+                        xx_neg, pp_neg, ee_neg, _, merge_info_neg, internals_neg = _forward(model, neg, device)
 
                     mot_loss = model.freq_loss(internals_pos,
                                                internals_neg,
@@ -226,7 +229,7 @@ def sys_train(model,
 
                 if mode in ('sil', 'combined') and controller.keep_going('mot') and controller.keep_going('sil'):
                     sil_loss = model.sil_loss(internals_pos,
-                                              merge_info_pos['spotlights'],
+                                              merge_info_pos,
                                               sil_tracker,
                                               momentum=sil_momentum)
                     loss += sil_loss * lam
@@ -272,7 +275,7 @@ def sys_train(model,
                 if rec_kernel == 'wl':
                     rec_loss = model.rec_loss_wl(xx_pos,
                                                  ee_pos,
-                                                 merge_info_pos['spotlights'],
+                                                 merge_info_pos,
                                                  source_graph,
                                                  internals_pos,
                                                  edge_sample_rate=edge_sample_rate,
@@ -280,7 +283,7 @@ def sys_train(model,
                 else:
                     rec_loss = model.rec_loss(xx_pos,
                                             ee_pos,
-                                            merge_info_pos['spotlights'],
+                                            merge_info_pos,
                                             source_graph,
                                             internals_pos
                                             )
@@ -307,7 +310,7 @@ def sys_train(model,
 
                 if mode in ('sil', 'combined') and controller.keep_going('mot') and controller.keep_going('sil'):
                     sil_loss = model.sil_loss(internals_pos,
-                                              merge_info_pos['spotlights'],
+                                              merge_info_pos,
                                               sil_tracker,
                                               momentum=sil_momentum)
 
@@ -336,11 +339,13 @@ def sys_train(model,
         test_loss_str = ' '.join([f'{k} test: {v:2f}' for k, v in test_losses.items()])
         model.to(device)
         time_elapsed = time.time() - start_time
-        print(f"Train Epoch: {epoch+1} [{batch_idx +1}/{num_batches}]"\
-              f"({100. * (batch_idx +1) / num_batches :.2f}%) {loss_str}"\
-              f" {test_loss_str}"\
-              f" Time: {time_elapsed:.2f}"
-              )
+        msg = (f"Train Epoch: {epoch+1} [{batch_idx+1}/{num_batches}]"
+               f"({100. * (batch_idx+1) / num_batches:.2f}%) {loss_str}"
+               f" {test_loss_str}"
+               f" Time: {time_elapsed:.2f}")
+        print(msg)
+        log_file.write(msg + "\n")
+        log_file.flush()
 
         step = epoch * num_batches + batch_idx
         for k, v in losses.items():
@@ -357,3 +362,4 @@ def sys_train(model,
     }, f'models/{model_name}/{model_name}.pth')
 
     writer.close()
+    log_file.close()

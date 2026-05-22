@@ -62,13 +62,13 @@ class SysSyntheticDataset(Dataset):
     def __init__(self,
                  root,
                  motif_type='clique',
-                 motif_size=5,
-                 n_motifs=10,
+                 motif_size=10,
+                 n_motifs=20,
                  parent_size=1000,
-                 parent_e_prob=0.005,
+                 parent_e_prob=0.1,
                  random_e_prob=None,
                  distort_p=0.0,
-                 seed=0,
+                 seed=42,
                  max_degree=None,
                  n_features=None,
                  transform=None,
@@ -96,6 +96,24 @@ class SysSyntheticDataset(Dataset):
 
         # load processed graph once and build igraph
         self.cached_data = torch.load(self.processed_paths[0], weights_only=False)
+
+        # warn if caller's params differ from what was stored at generation time.
+        # does not block loading (cached data is used regardless); exists to
+        # catch cases where a regeneration overwrote a dataset with wrong params.
+        stored = self._stored_params()
+        if stored is not None:
+            cur = self._current_params()
+            mismatches = {k: (stored.get(k), cur[k]) for k in cur if stored.get(k) != cur[k]}
+            if mismatches:
+                import warnings
+                warnings.warn(
+                    f"SysSyntheticDataset: loaded cached data from {self.processed_dir!r} "
+                    f"but caller params differ from generation params. "
+                    f"Mismatches: {mismatches}. "
+                    f"If this is intentional (pre-generated dataset), ignore this warning. "
+                    f"If not, delete the processed directory and regenerate.",
+                    UserWarning, stacklevel=2,
+                )
         edges = self.cached_data.edge_index.t().tolist()
         self.ig_graph = Graph(
             n=self.cached_data.num_nodes,
@@ -116,6 +134,31 @@ class SysSyntheticDataset(Dataset):
     @property
     def processed_file_names(self):
         return ['system_synth_graph.pt']
+
+    def _stored_params(self):
+        import json, os
+        p = os.path.join(self.processed_dir, 'gen_params.json')
+        if not os.path.exists(p):
+            return None
+        with open(p) as f:
+            return json.load(f)
+
+    def _current_params(self):
+        return {
+            'motif_type': self.motif_type if isinstance(self.motif_type, str) else list(self.motif_type),
+            'motif_size': self.motif_size,
+            'n_motifs': self.n_motifs,
+            'parent_size': self.parent_size,
+            'parent_e_prob': round(self.parent_e_prob, 6),
+            'distort_p': round(self.distort_p, 4),
+            'seed': self.seed,
+        }
+
+    def _save_params(self):
+        import json, os
+        p = os.path.join(self.processed_dir, 'gen_params.json')
+        with open(p, 'w') as f:
+            json.dump(self._current_params(), f, indent=2)
 
     @property
     def num_features(self):
@@ -249,6 +292,7 @@ class SysSyntheticDataset(Dataset):
         data.num_embedded_instances = torch.tensor(total_instances, dtype=torch.long)
 
         torch.save(data, self.processed_paths[0])
+        self._save_params()
 
     # ------------------------------------------------------------------
     # single-graph dataset contract

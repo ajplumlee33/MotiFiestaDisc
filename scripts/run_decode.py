@@ -10,10 +10,10 @@ from MotiFiesta.training.disc_decode import DiscHashDecoder
 
 def main():
     decoder = DiscHashDecoder(
-        model_id='sys_synth-clique-com2-p0.1-n1000-d0.00',
-        dataset_id='sys_synth-clique-p0.1-n1000-d0.00',
-        dataset_root='data/sys_synth-clique-p0.1-n1000-d0.00',
-        level=3,
+        model_id='sys_synth-clique-com-p0.1-n1000-k10-d0.05',
+        dataset_id='sys_synth-clique-p0.1-n1000-k10-d0.05',
+        dataset_root='data/sys_synth-clique-p0.1-n1000-k10-d0.05',
+        level=4,
         hash_dim=4
     )
 
@@ -28,10 +28,10 @@ def main():
     print("\n=== top motifs ===")
     out = decoder.export_all(
         results,
-        out_dir='decoded/sys_synth-clique-com2-p0.1-n1000-d0.00',
+        out_dir='decoded/sys_synth-clique-com-p0.1-n1000-k10-d0.05',
         top_n=10,
-        min_size=3,
-        max_size=8,
+        min_size=5,
+        max_size=12,
         require_connected=True,
         min_instances=1,
         rank_by='total_score',

@@ -246,6 +246,131 @@ def batch_to_node_indices(batch):
     assert len(indices) == len(batch)
     return indices
 
+
+# ---------------------------------------------------------------------------
+# tensor-based spotlight tracking
+# ---------------------------------------------------------------------------
+# spotlight_assignment[t]: long tensor (n_batch_nodes,) where entry i is the
+# supernode index at level t that original local node i belongs to.
+# cluster_chain[t]: long tensor (n_supernodes_at_t,), maps level-t supernode
+# index to level-(t+1) supernode index.
+# n_id: long tensor (n_batch_nodes,) of global node ids.
+
+
+def spotlight_at(spotlight_assignment, n_id, t, supernode_idx):
+    """global node ids in the spotlight of supernode `supernode_idx` at level t."""
+    mask = spotlight_assignment[t] == supernode_idx
+    local_members = mask.nonzero(as_tuple=False).squeeze(-1)
+    return n_id[local_members]
+
+
+def edge_spotlight(spotlight_assignment, n_id, t, u_idx, v_idx):
+    """global node ids in the union of u's and v's spotlights at level t."""
+    spot_t = spotlight_assignment[t]
+    mask = (spot_t == u_idx) | (spot_t == v_idx)
+    local_members = mask.nonzero(as_tuple=False).squeeze(-1)
+    return n_id[local_members]
+
+
+def children_at(cluster_chain, t, supernode_idx):
+    """level-(t-1) supernode indices that merged into `supernode_idx` at level t."""
+    if t < 1:
+        return torch.empty(0, dtype=torch.long)
+    cluster = cluster_chain[t - 1]
+    mask = cluster == supernode_idx
+    return mask.nonzero(as_tuple=False).squeeze(-1)
+
+
+def spotlight_key(global_ids):
+    """hashable key (sorted tuple of ints) for tracker lookups."""
+    if isinstance(global_ids, torch.Tensor):
+        return tuple(sorted(global_ids.tolist()))
+    return tuple(sorted(global_ids))
+
+
+def get_edge_subgraphs_tensor(edge_index, spotlight_assignment, n_id, level,
+                              source_graph, source_x):
+    """edge spotlight subgraphs from the tensor representation.
+
+    for each edge (u, v) in edge_index, builds the induced subgraph of
+    source_graph over the union of u's and v's spotlights at level. returns
+    (list of igraph subgraphs, list of feature arrays).
+    """
+    subgraphs = []
+    X = []
+    spot_t = spotlight_assignment[level]
+    n_id_cpu = n_id.cpu()
+
+    for u, v in edge_index.T:
+        u_idx = u.item()
+        v_idx = v.item()
+        mask = (spot_t == u_idx) | (spot_t == v_idx)
+        local_members = mask.nonzero(as_tuple=False).squeeze(-1).cpu()
+        global_ids_sorted = sorted(n_id_cpu[local_members].tolist())
+
+        subgraph = source_graph.subgraph(global_ids_sorted)
+        node_features = np.stack([
+            source_x[g].cpu().numpy() for g in global_ids_sorted
+        ])
+
+        subgraphs.append(subgraph)
+        X.append(node_features)
+
+    return subgraphs, X
+
+
+# ---------------------------------------------------------------------------
+# negative sample generation
+# ---------------------------------------------------------------------------
+
+def torch_double_edge_swap(edge_index, n_swaps=20):
+    """parallel double edge swap for negative sample generation.
+
+    classical double edge swap: pick two undirected edges (a, b) and (c, d),
+    swap to (a, d) and (b, c). preserves degree sequence exactly. drops the
+    connectivity constraint — fine for contrastive losses where structural
+    randomization is the goal.
+    """
+    device = edge_index.device
+    src_full, dst_full = edge_index[0], edge_index[1]
+
+    canon = src_full < dst_full
+    can_src = src_full[canon].clone()
+    can_dst = dst_full[canon].clone()
+    n_canon = can_src.size(0)
+
+    if n_canon < 2:
+        return edge_index
+
+    n_use = min(2 * n_swaps, n_canon - (n_canon % 2))
+    if n_use < 2:
+        return edge_index
+
+    perm = torch.randperm(n_canon, device=device)[:n_use]
+    i_idx = perm[0::2]
+    j_idx = perm[1::2]
+
+    new_dst_i = can_dst[j_idx].clone()
+    new_dst_j = can_dst[i_idx].clone()
+    can_dst[i_idx] = new_dst_i
+    can_dst[j_idx] = new_dst_j
+
+    # restore canonical form after swap may have reversed endpoints
+    swapped = can_src > can_dst
+    final_src = torch.where(swapped, can_dst, can_src)
+    final_dst = torch.where(swapped, can_src, can_dst)
+
+    # drop self-loops the swap may have created
+    mask = final_src != final_dst
+    final_src = final_src[mask]
+    final_dst = final_dst[mask]
+
+    return torch.stack([
+        torch.cat([final_src, final_dst]),
+        torch.cat([final_dst, final_src])
+    ])
+
+
 if __name__ == "__main__":
     import doctest
     doctest.testmod()

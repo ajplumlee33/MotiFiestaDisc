@@ -160,29 +160,11 @@ class EdgePooling(torch.nn.Module):
             * **unpool_info** *(unpool_description)* - Information that is
               consumed by :func:`EdgePooling.unpool` for unpooling.
         """
-        # carlos: do one conv operation before scoring
-        x = x.to(torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu"))
-
-        # computes features for each edge-connected node pair, normally just
-        # sum pool
-
-        # firt transform merged embeddings
-        # print("x in ", x[:10])
-        # print("x in ", x.shape)
-        # print("in ", x)
         x_merged = self.edge_merge(x, edge_index)
-        # print("in merge", x_merged)
-        # print("x merge ", x_merged[:10])
         x_merged = self.transform(x_merged)
-        # x_merged = self.transform_activate(x_merged)
-        # x_merged = self.transform_2(x_merged)
-        # print("x trans", x_merged[:10])
-        # x_merged = self.transform_activate(x_merged)
-        # print("x activate", x_merged[:10])
-        # print("x merge and transf ", x_merged.shape)
 
         # compute features for each node with itself in case node is not pooled
-        e_ind_self = torch.tensor([list(range(len(x))), list(range(len(x)))])
+        e_ind_self = torch.tensor([list(range(len(x))), list(range(len(x)))], device=x.device)
         x_merged_self = self.edge_merge(x, e_ind_self)
         x_merged_self = self.transform(x_merged_self)
         # x_merged_self = self.transform_activate(x_merged_self)
@@ -195,7 +177,7 @@ class EdgePooling(torch.nn.Module):
         e = self.compute_edge_score(e, edge_index, x.size(0), batch)
 
         if dummy:
-            e = torch.full(e.shape, .5, dtype=torch.float32)
+            e = torch.full(e.shape, .5, dtype=torch.float32, device=e.device)
 
         if self.parallel_matching:
             x_new, edge_index, batch, unpool_info = self.__merge_edges_parallel__(
@@ -268,9 +250,7 @@ class EdgePooling(torch.nn.Module):
 
         cluster = cluster.to(x.device)
 
-        # carlos
-        new_x = torch.zeros((len(emb_cat), len(emb_cat[0])), dtype=torch.float)
-        new_x = new_x.to(torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu"))
+        new_x = torch.zeros((len(emb_cat), len(emb_cat[0])), dtype=torch.float, device=x.device)
         for ind, emb in enumerate(emb_cat):
             new_x[ind] = emb
 
@@ -371,9 +351,11 @@ class EdgePooling(torch.nn.Module):
         random_gate = torch.rand(n_canon, device=device)
         edges_alive = random_gate < canon_score
 
-        priority = canon_score.double() + 1e-9 * torch.rand(
-            n_canon, dtype=torch.float64, device=device
-        )
+        if device.type == 'mps':
+            # mps lacks float64; use float32 with larger noise for tiebreaking
+            priority = canon_score + 1e-4 * torch.rand(n_canon, dtype=torch.float32, device=device)
+        else:
+            priority = canon_score.double() + 1e-9 * torch.rand(n_canon, dtype=torch.float64, device=device)
 
         cluster = torch.full((num_nodes,), -1, dtype=torch.long, device=device)
         nodes_taken = torch.zeros(num_nodes, dtype=torch.bool, device=device)
@@ -387,15 +369,24 @@ class EdgePooling(torch.nn.Module):
 
             masked_priority = torch.where(
                 edges_alive, priority,
-                torch.full_like(priority, float('-inf'), dtype=torch.float64)
+                torch.full_like(priority, float('-inf'))
             )
 
-            node_max = torch.full((num_nodes,), float('-inf'),
-                                  dtype=torch.float64, device=device)
-            node_max.scatter_reduce_(0, src, masked_priority,
-                                     reduce='amax', include_self=True)
-            node_max.scatter_reduce_(0, dst, masked_priority,
-                                     reduce='amax', include_self=True)
+            if device.type == 'mps':
+                # scatter_reduce_ amax unsupported on mps; num_nodes is tiny so cpu cost is negligible
+                _nm = torch.full((num_nodes,), float('-inf'))
+                _nm.scatter_reduce_(0, src.cpu(), masked_priority.cpu(),
+                                    reduce='amax', include_self=True)
+                _nm.scatter_reduce_(0, dst.cpu(), masked_priority.cpu(),
+                                    reduce='amax', include_self=True)
+                node_max = _nm.to(device)
+            else:
+                node_max = torch.full((num_nodes,), float('-inf'),
+                                      dtype=torch.float64, device=device)
+                node_max.scatter_reduce_(0, src, masked_priority,
+                                         reduce='amax', include_self=True)
+                node_max.scatter_reduce_(0, dst, masked_priority,
+                                         reduce='amax', include_self=True)
 
             selected = (
                 edges_alive
