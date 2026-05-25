@@ -16,6 +16,8 @@ def get_device(n_features=None):
 
     if set_device() was called previously, returns that device.
     if n_features is provided and below _GPU_FEATURE_THRESHOLD, returns cpu.
+    pass model.hidden_dim (not input features) — hidden_dim governs all
+    intermediate computation cost; input features only affect the first layer.
     otherwise prefers cuda > mps > cpu.
     """
     global device_cache

@@ -1,9 +1,9 @@
 import os
 from collections import defaultdict
-from itertools import permutations
 
 import networkx as nx
 import torch
+import torch.nn.functional as F
 from torch_geometric.utils import to_networkx
 from lshashpy3 import LSHash
 
@@ -12,7 +12,7 @@ from MotiFiesta.training.loading import get_loader
 
 
 class Decoder:
-    def __init__(self, model_id, dataset_id, dataset_root=None):
+    def __init__(self, model_id, dataset_id, dataset_root=None, **dataset_kwargs):
         self.model_id = model_id
         self.dataset_id = dataset_id
 
@@ -20,7 +20,7 @@ class Decoder:
         print(self.model)
 
         root = dataset_root if dataset_root is not None else dataset_id
-        self.dataset = get_loader(root=root, name=dataset_id)
+        self.dataset = get_loader(root=root, name=dataset_id, **dataset_kwargs)
         pass
 
     def decode(self):
@@ -50,9 +50,11 @@ class DiscHashDecoder(Decoder):
                  model_id,
                  dataset_id,
                  dataset_root=None,
-                 hash_dim=4,
+                 hash_dim=8,
                  dummy=False,
-                 level=2):
+                 level=2,
+                 batch_size=64,
+                 **dataset_kwargs):
         self.level = level
         self.dummy = dummy
         self.hash_dim = hash_dim
@@ -60,6 +62,8 @@ class DiscHashDecoder(Decoder):
         super().__init__(model_id=model_id,
                          dataset_id=dataset_id,
                          dataset_root=dataset_root,
+                         batch_size=batch_size,
+                         **dataset_kwargs,
                          )
 
     # ------------------------------------------------------------------
@@ -143,91 +147,107 @@ class DiscHashDecoder(Decoder):
 
         return nx.to_graph6_bytes(g_canon, header=False).decode().strip()
 
-    def decode(self, n_graphs=-1):
+    def decode(self, n_batches=-1):
         """
-        run the trained model on every graph in the dataset and collect motif
-        instances at the configured contraction level.
+        run the trained model on neighborhood batches of the source graph and
+        collect motif instances at the configured contraction level.
 
-        returns a list of per-graph decoded results. each result is a dict:
+        uses loader_whole (same neighborloader and batch size as training) so
+        each batch sees the same neighborhood-scale context the model was
+        trained on. nodes appear in multiple overlapping batches; the
+        highest-sigma assignment wins per node. spotlights are rebuilt by
+        grouping nodes by their winning hash after all batches are processed.
+
+        when sil_loss achieves full sampling invariance, different batches
+        containing the same motif instance will produce identical level-t
+        embeddings and hash to the same bucket. the quality of this decode
+        is therefore a direct readout of how well sil_loss is working.
+
+        returns a list with one result dict (single source graph):
           - 'source_nx': nx graph of the full input
-          - 'spotlights': list of sets of original node ids
-          - 'scores': list of cumulative sigma scores
+          - 'spotlights': list of sets of original node ids (one per hash bucket)
+          - 'scores': list of mean sigma scores per bucket
           - 'hashes': list of lsh bucket ids
-          - 'pyg': the original pyg data object (for ground-truth access)
+          - 'pyg': the full pyg data object (for ground-truth access)
         """
         hash_table = LSHash(self.hash_dim, self.model.hidden_dim)
         self.model.eval()
 
-        results = []
+        # full graph for source_nx and ground-truth pyg
+        g_full = None
+        for g_pair in self.dataset['dataset_whole']:
+            g_full = g_pair['pos'] if isinstance(g_pair, dict) else g_pair
+            break
+        source_nx = to_networkx(g_full, to_undirected=True)
 
-        for idx, g_pair in enumerate(self.dataset['dataset_whole']):
-            if n_graphs > -1 and idx >= n_graphs:
+        # per-node best assignment: global_node_id → (score, hash)
+        node_best_score = {}
+        node_best_hash = {}
+
+        for batch_idx, batch in enumerate(self.dataset['loader_whole']):
+            if n_batches > -1 and batch_idx >= n_batches:
                 break
 
-            g = g_pair['pos'] if isinstance(g_pair, dict) else g_pair
-
-            batch = torch.zeros(len(g.x), dtype=torch.long)
+            pos = batch['pos']
 
             with torch.no_grad():
                 embs, probas, ee, _, merge_info, _ = self.model(
-                    g.x, g.edge_index, batch, dummy=self.dummy)
+                    pos.x, pos.edge_index, pos.batch,
+                    n_id=pos.n_id, dummy=self.dummy)
 
             if self.level > len(embs) - 1:
                 continue
 
-            # cache edge->index lookups once per graph
             ee_lookups = []
             for layer_ee in ee:
                 lookup = {tuple(sorted((e[0], e[1]))): i
                           for i, e in enumerate(layer_ee.t().tolist())}
                 ee_lookups.append(lookup)
 
-            source_nx = to_networkx(g, to_undirected=True)
-
-            # pull the tensor-based merge_info fields
             spot_assign = merge_info['spotlight_assignment']
             cluster_chain = merge_info['cluster_chain']
-            n_id = merge_info['n_id']
+            n_id = merge_info['n_id']  # global node ids for this batch
 
             spot_at_level = spot_assign[self.level]
 
-            spotlights = []
-            scores = []
-            hashes = []
-
-            # center embeddings before hashing. random-hyperplane lsh
-            # measures angular similarity from the origin, so if all
-            # embeddings sit in one corner of the space (e.g. mean=-3.5)
-            # they collapse to the same bucket regardless of hash_dim or
-            # internal spread. zero-mean the level-T embeddings so the
-            # hyperplanes cut through the data, not past it.
             level_emb = embs[self.level]
             level_emb_centered = level_emb - level_emb.mean(dim=0, keepdim=True)
 
-            for i, x in enumerate(level_emb):
+            for i in range(level_emb.size(0)):
                 h = hash_table.index(level_emb_centered[i].detach().numpy())[0]
 
-                # get global node ids in the spotlight of supernode i at self.level
                 mask = spot_at_level == i
                 local_members = mask.nonzero(as_tuple=False).squeeze(-1)
                 spot = set(n_id[local_members].tolist())
 
                 score = self.total_sigma(self.level, i, cluster_chain,
                                          probas, ee_lookups)
+                score_val = float(score) if torch.is_tensor(score) else score
 
-                spotlights.append(spot)
-                scores.append(float(score) if torch.is_tensor(score) else score)
-                hashes.append(h)
+                # keep highest-sigma assignment per node across overlapping batches
+                for node in spot:
+                    if node not in node_best_score or score_val > node_best_score[node]:
+                        node_best_score[node] = score_val
+                        node_best_hash[node] = h
 
-            results.append({
-                'source_nx': source_nx,
-                'spotlights': spotlights,
-                'scores': scores,
-                'hashes': hashes,
-                'pyg': g,
-            })
+        # rebuild spotlights grouped by winning hash
+        hash_to_nodes = defaultdict(set)
+        hash_to_scores = defaultdict(list)
+        for node, h in node_best_hash.items():
+            hash_to_nodes[h].add(node)
+            hash_to_scores[h].append(node_best_score[node])
 
-        return results
+        spotlights = list(hash_to_nodes.values())
+        hashes = list(hash_to_nodes.keys())
+        scores = [sum(s) / len(s) for s in hash_to_scores.values()]
+
+        return [{
+            'source_nx': source_nx,
+            'spotlights': spotlights,
+            'scores': scores,
+            'hashes': hashes,
+            'pyg': g_full,
+        }]
 
     # ------------------------------------------------------------------
     # pattern extraction and ranking (g6-based, used for nemomap export)
@@ -386,120 +406,149 @@ class DiscHashDecoder(Decoder):
         return g6s
 
     @staticmethod
-    def _jaccard(a, b):
-        if not a and not b:
-            return 1.0
-        inter = len(a & b)
-        union = len(a | b)
-        return inter / union if union else 0.0
+    def collect_output(results, min_size=1, max_size=999):
+        """flatten per-graph spotlight assignments into concatenated tensors.
 
-    def evaluate(self, results, patterns_ranked, min_size, max_size):
+        mirrors collect_output in decode.py. assigns each node to an integer
+        bucket id based on its spotlight's lsh hash (1-indexed; 0 = unassigned),
+        reindexes bucket ids to be contiguous from 0, and returns flat tensors
+        ready for ranking and metric computation.
+
+        returns:
+            motifs_pred_all : long (N,)  — reindexed bucket id per node
+            true_motif_ids  : long (N,)  — binary motif label (K=1, >0 → 1)
+            sigma_all       : float (N,) — per-node sigma score
+            graph_sizes     : list[int]  — num_nodes per graph
         """
-        type-level evaluation against embedded ground truth.
+        motifs_pred_all = []
+        true_motif_ids = []
+        sigma_all = []
+        graph_sizes = []
+        hash_to_int = {}
 
-        primary metric is lsh-bucket m-jaccard, matching the paper's decoding
-        methodology (algorithm 2). also reports g6 pattern set-overlap as a
-        sanity check on the nemomap export side: did the top-ranked g6
-        patterns include the canonical topology of the embedded motifs.
+        for res in results:
+            pyg = res['pyg']
+            n_nodes = pyg.x.size(0)
+            graph_sizes.append(n_nodes)
 
-        returns an empty dict if no ground truth is present.
-        """
-        if not self._has_ground_truth(results):
-            return {}
+            node_pred = torch.zeros(n_nodes, dtype=torch.long)
+            node_score = torch.zeros(n_nodes, dtype=torch.float32)
 
-        embedded_g6s = self._embedded_g6s(results)
-        predicted_g6s = {p['label'] for p in patterns_ranked}
-
-        hit_labels = predicted_g6s & embedded_g6s if predicted_g6s and embedded_g6s else set()
-
-        lsh_jaccard = self._lsh_permutation_jaccard(
-            results, top_n=len(patterns_ranked),
-            min_size=min_size, max_size=max_size)
-
-        return {
-            'embedded_g6s': sorted(embedded_g6s),
-            'hit_labels': sorted(hit_labels),
-            'jaccard': lsh_jaccard,
-        }
-
-    def _lsh_permutation_jaccard(self, results, top_n, min_size, max_size):
-        """
-        lsh-bucket m-jaccard, matching the paper's decoding methodology
-        (algorithm 2). spotlights are grouped by their lsh hash bucket,
-        buckets are ranked by mean sigma score (paper algorithm 2 line 7),
-        and the top_n buckets are treated as the predicted motif types for
-        the permutation alignment against motif_id ground truth.
-
-        size filter (min_size, max_size) matches extract_patterns defaults
-        so the lsh pool and the g6 pool see the same spotlights.
-        """
-        bucket_sum_scores = defaultdict(float)
-        bucket_counts = defaultdict(int)
-        bucket_nodes_per_src = defaultdict(lambda: defaultdict(set))
-
-        for src_idx, res in enumerate(results):
-            for spot, score, h in zip(res['spotlights'],
-                                      res['scores'],
-                                      res['hashes']):
+            for spot, score, h in zip(res['spotlights'], res['scores'], res['hashes']):
                 if not (min_size <= len(spot) <= max_size):
                     continue
-                bucket_sum_scores[h] += score
-                bucket_counts[h] += 1
-                bucket_nodes_per_src[h][src_idx].update(spot)
+                if h not in hash_to_int:
+                    hash_to_int[h] = len(hash_to_int) + 1  # 1-indexed, 0 = no assignment
+                h_int = hash_to_int[h]
+                for node in spot:
+                    if node < n_nodes:
+                        node_pred[node] = h_int
+                        node_score[node] = score
 
-        if not bucket_sum_scores:
-            return 0.0
+            motifs_pred_all.append(node_pred)
+            sigma_all.append(node_score)
 
-        # rank by mean score per bucket (paper algorithm 2, line 7)
-        bucket_mean_scores = {b: bucket_sum_scores[b] / bucket_counts[b]
-                              for b in bucket_sum_scores}
-        top_buckets = sorted(bucket_mean_scores.keys(),
-                             key=lambda b: bucket_mean_scores[b],
-                             reverse=True)[:top_n]
+            # K=1: collapse all instance ids to one motif class
+            if hasattr(pyg, 'motif_id') and pyg.motif_id is not None:
+                true_motif_ids.append((pyg.motif_id > 0).long())
+            else:
+                true_motif_ids.append(torch.zeros(n_nodes, dtype=torch.long))
 
-        best_total = 0.0
-        graphs_with_truth = 0
+        motifs_pred_all = torch.cat(motifs_pred_all)
+        true_motif_ids = torch.cat(true_motif_ids)
+        sigma_all = torch.cat(sigma_all)
 
-        for src_idx, res in enumerate(results):
+        # reindex bucket ids to contiguous 0..M
+        motifs_input = torch.unique(motifs_pred_all)
+        motif_indices = {m.item(): i for i, m in enumerate(motifs_input)}
+        for i in range(len(motifs_pred_all)):
+            motifs_pred_all[i] = motif_indices[motifs_pred_all[i].item()]
+
+        return motifs_pred_all, true_motif_ids, sigma_all, graph_sizes
+
+    def eval(self, results, top_k=1, min_size=1, max_size=999):
+        """m-jaccard (paper eq. 1 / alg. 2) and instance recall.
+
+        calls collect_output to get flat tensors, ranks buckets by mean sigma,
+        keeps top_k, then computes:
+          jaccard        : best node-level jaccard over predicted columns (eq. 2)
+          instance_recall: fraction of planted instances with majority of nodes
+                           in any top-k bucket (unaffected by bucket FP)
+
+        returns dict with 'jaccard' and 'instance_recall'.
+        """
+        if not results:
+            return {'jaccard': 0.0, 'instance_recall': 0.0}
+
+        motifs_pred_all, true_motif_ids, sigma_all, graph_sizes = \
+            DiscHashDecoder.collect_output(results, min_size=min_size, max_size=max_size)
+
+        # rank buckets by mean sigma (algorithm 2, line 7)
+        motif_ids, counts = torch.unique(motifs_pred_all, return_counts=True)
+        sigma_avg = torch.zeros_like(motif_ids, dtype=torch.float32).scatter_add(
+            0, motifs_pred_all, sigma_all) / counts
+
+        motifs_sorted = torch.argsort(sigma_avg, descending=True)
+        ranks = torch.zeros_like(motifs_sorted)
+        for ind, val in enumerate(motifs_sorted):
+            ranks[val] = ind
+
+        # kill buckets below top_k
+        motifs_pred_all = torch.where(ranks[motifs_pred_all] < top_k,
+                                      motifs_pred_all + 1, torch.zeros_like(motifs_pred_all))
+
+        # instance recall: per-instance majority vote against top-k buckets.
+        # motif_id is binary (0/1), so instances are inferred from connected
+        # components of the motif subgraph rather than motif_id values.
+        total_instances = 0
+        found_instances = 0
+        node_offset = 0
+        for res, n_nodes in zip(results, graph_sizes):
             pyg = res['pyg']
-            if not hasattr(pyg, 'motif_id') or pyg.motif_id is None:
+            pred_slice = motifs_pred_all[node_offset:node_offset + n_nodes]
+            node_offset += n_nodes
+            if not (hasattr(pyg, 'motif_id') and pyg.motif_id is not None):
                 continue
-
-            motif_ids = pyg.motif_id.tolist()
-            n_nodes = len(motif_ids)
-
-            # bucket rank (index in top_buckets) is the cluster id
-            pred_assign = [-1] * n_nodes
-            for b_idx, bucket in enumerate(top_buckets):
-                for node in bucket_nodes_per_src[bucket].get(src_idx, set()):
-                    if pred_assign[node] == -1:
-                        pred_assign[node] = b_idx
-
-            true_labels = sorted({m for m in motif_ids if m > 0})
-            pred_labels = sorted({p for p in pred_assign if p >= 0})
-            if not true_labels or not pred_labels:
+            motif_nodes = [n for n, mid in enumerate(pyg.motif_id.tolist()) if mid > 0]
+            if not motif_nodes:
                 continue
+            motif_sub = res['source_nx'].subgraph(motif_nodes)
+            for comp in nx.connected_components(motif_sub):
+                nodes = list(comp)
+                total_instances += 1
+                n_found = sum(1 for n in nodes if pred_slice[n].item() > 0)
+                if n_found > len(nodes) / 2:
+                    found_instances += 1
+        instance_recall = found_instances / total_instances if total_instances > 0 else 0.0
 
-            graphs_with_truth += 1
+        # build pred and true one-hot matrices
+        pred = F.one_hot(motifs_pred_all)
+        non_empty_mask = pred.abs().sum(dim=0).bool()
+        pred = pred[:, non_empty_mask]
 
-            best_jacc = 0.0
-            K = len(true_labels)
-            k = min(len(pred_labels), K)
-            for perm in permutations(pred_labels, k):
-                mapping = dict(zip(perm, true_labels[:k]))
-                total = 0.0
-                for p_lab, t_lab in mapping.items():
-                    pred_nodes = {i for i, p in enumerate(pred_assign)
-                                  if p == p_lab}
-                    true_nodes = {i for i, m in enumerate(motif_ids)
-                                  if m == t_lab}
-                    total += self._jaccard(pred_nodes, true_nodes)
-                avg = total / K  # paper eq. 1: average over K true motif types
-                if avg > best_jacc:
-                    best_jacc = avg
-            best_total += best_jacc
+        # column 0 is the "not predicted" pool (nodes killed by top_k or outside size
+        # filters). it must be excluded from the jaccard loop — it's not a prediction.
+        # after non_empty_mask the 0-bucket remains as the first column whenever any
+        # node was unassigned; drop it so only actual bucket predictions are scored.
+        if pred.shape[1] > 0 and (motifs_pred_all == 0).any():
+            pred = pred[:, 1:]
 
-        return best_total / graphs_with_truth if graphs_with_truth else 0.0
+        true = F.one_hot(true_motif_ids)[:, 1:]  # drop background column, K=1
+
+        if true.shape[1] == 0 or pred.shape[1] == 0:
+            return {'jaccard': 0.0, 'instance_recall': instance_recall}
+
+        # permutation test (eq. 2): try each predicted column against the single true column
+        best_jaccard = 0.0
+        for col in range(pred.shape[1]):
+            pred_col = pred[:, col:col+1].float()
+            num = torch.min(pred_col, true.float()).sum(dim=0)  # eq. 1 numerator
+            den = torch.max(pred_col, true.float()).sum(dim=0)  # eq. 1 denominator
+            jaccard = (num / den).sum().item()
+            if jaccard > best_jaccard:
+                best_jaccard = jaccard
+
+        return {'jaccard': best_jaccard, 'instance_recall': instance_recall}
 
     # ------------------------------------------------------------------
     # exports
@@ -594,8 +643,18 @@ class DiscHashDecoder(Decoder):
                                          min_instances=min_instances)
         ranked = self.rank_patterns(patterns, top_n=top_n, by=rank_by)
 
-        eval_metrics = self.evaluate(results, ranked,
-                                      min_size=min_size, max_size=max_size)
+        eval_metrics = {}
+        if self._has_ground_truth(results):
+            embedded_g6s = self._embedded_g6s(results)
+            predicted_g6s = {p['label'] for p in ranked}
+            hit_labels = predicted_g6s & embedded_g6s if predicted_g6s and embedded_g6s else set()
+            ev = self.eval(results, top_k=len(ranked), min_size=min_size, max_size=max_size)
+            eval_metrics = {
+                'embedded_g6s': sorted(embedded_g6s),
+                'hit_labels': sorted(hit_labels),
+                'jaccard': ev['jaccard'],
+                'instance_recall': ev['instance_recall'],
+            }
 
         collection_path = self.export_nemocollection(
             ranked, os.path.join(out_dir, 'motifiesta_collection.txt'))
@@ -605,10 +664,11 @@ class DiscHashDecoder(Decoder):
         self.print_stats(ranked, eval_metrics=eval_metrics)
 
         if eval_metrics:
-            predicted_g6s = sorted({p['label'] for p in ranked})
-            print(f"\nm-jaccard:     {eval_metrics['jaccard']:.4f}")
+            predicted_g6s_sorted = sorted({p['label'] for p in ranked})
+            print(f"\nm-jaccard:        {eval_metrics['jaccard']:.4f}")
+            print(f"instance recall:  {eval_metrics['instance_recall']:.4f}")
             print(f"embedded g6s:  {', '.join(eval_metrics['embedded_g6s'])}")
-            print(f"predicted g6s: {', '.join(predicted_g6s)}")
+            print(f"predicted g6s: {', '.join(predicted_g6s_sorted)}")
             print(f"hit labels:    {', '.join(eval_metrics['hit_labels']) or 'none'}")
 
         return {

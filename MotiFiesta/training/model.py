@@ -41,7 +41,9 @@ class MotiFiestaModel(torch.nn.Module):
                  merge_method='sum',
                  global_pool=global_add_pool,
                  edge_score_method='sigmoid',
-                 parallel_matching=False,
+                 matching_mode='greedy',
+                 scoring_mode='mlp',
+                 n_heads=4,
                  ):
         super(MotiFiestaModel, self).__init__()
 
@@ -53,7 +55,9 @@ class MotiFiestaModel(torch.nn.Module):
         self.edge_score_method = edge_score_method
         self.merge_method = merge_method
         self.hard_embed = hard_embed
-        self.parallel_matching = parallel_matching
+        self.matching_mode = matching_mode
+        self.scoring_mode = scoring_mode
+        self.n_heads = n_heads
 
         self.layers = self.build_layers()
 
@@ -63,14 +67,18 @@ class MotiFiestaModel(torch.nn.Module):
                                   self.hidden_dim,
                                   edge_score_method=self.edge_score_method,
                                   merge_method=self.merge_method,
-                                  parallel_matching=self.parallel_matching,
+                                  matching_mode=self.matching_mode,
+                                  scoring_mode=self.scoring_mode,
+                                  n_heads=self.n_heads,
                                   ))
         for s in range(self.steps):
             layers.append(EdgePooling(self.hidden_dim,
                                       self.hidden_dim,
                                       edge_score_method=self.edge_score_method,
                                       merge_method=self.merge_method,
-                                      parallel_matching=self.parallel_matching,
+                                      matching_mode=self.matching_mode,
+                                      scoring_mode=self.scoring_mode,
+                                      n_heads=self.n_heads,
                                       )
                           )
 
