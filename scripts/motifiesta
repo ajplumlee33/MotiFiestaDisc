@@ -47,6 +47,10 @@ if function == 'train':
 
 
     parser.add_argument("--lam",  type=float, default=1)
+    parser.add_argument("--sil-lam", type=float, default=1.0,
+                        help="SIL loss weight, independent of --lam. "
+                             "Controls sampling invariance signal strength "
+                             "without affecting edge score regularization.")
     parser.add_argument("--beta", type=float, default=1)
     parser.add_argument("--estimator", "-es", type=str, default='knn', help="Which density estimator to use for the motif agg. step")
     parser.add_argument("--n-neighbors", "-nn", type=int, default=30, help="Number of neighbors")
@@ -62,7 +66,14 @@ if function == 'train':
     parser.add_argument("--score-method", default="sigmoid", help="Edge scoring method: (sigmoid, softmax-neighbors, softmax-all)")
     parser.add_argument("--merge-method", default="sum", help="Edge merge method: (sum, cat, set2set)")
     parser.add_argument("--hard-embed", action='store_true', help="Whether to use hard embedding using degree histogram.")
-    parser.add_argument("--parallel-matching", action='store_true', default=False, help="Use Luby parallel matching in EdgePooling layers.")
+    parser.add_argument("--matching-mode", type=str, default='greedy',
+                        choices=['greedy', 'luby'],
+                        help="Edge matching algorithm: greedy (sequential), luby (parallel).")
+    parser.add_argument("--scoring-mode", type=str, default='mlp',
+                        choices=['mlp', 'attention'],
+                        help="Edge scoring: mlp (default), attention (multi-head dot-product).")
+    parser.add_argument("--n-heads", type=int, default=4,
+                        help="Number of attention heads (only used with --scoring-mode attention).")
 
     # --- Synthetic single-graph dataset flags (used only when data_root --
     # contains 'sys_synth'; silently ignored otherwise) -----------------------
@@ -89,7 +100,7 @@ if function == 'train':
     parser.add_argument("--distort-p", type=float, default=0.0,
                         help="Per-edge distortion probability applied to each "
                              "planted motif instance. 0.0 = exact topology.")
-    parser.add_argument("--dataset-seed", type=int, default=0,
+    parser.add_argument("--dataset-seed", type=int, default=42,
                         help="RNG seed for synthetic dataset generation. "
                              "Separate from training RNG.")
 
@@ -105,7 +116,9 @@ if function == 'train':
                         'edge_score_method': args.score_method,
                         'merge_method': args.merge_method,
                         'hard_embed': args.hard_embed,
-                        'parallel_matching': args.parallel_matching,
+                        'matching_mode': args.matching_mode,
+                        'scoring_mode': args.scoring_mode,
+                        'n_heads': args.n_heads,
                          },
                'train': {
                         'epochs': args.epochs,
@@ -206,6 +219,7 @@ if function == 'train':
                     hard_embed=args.hard_embed,
                     beta=args.beta,
                     lam=args.lam,
+                    sil_lam=args.sil_lam,
                     epoch_start=epoch_start,
                     optimizer=optimizer,
                     controller_state=controller_state,

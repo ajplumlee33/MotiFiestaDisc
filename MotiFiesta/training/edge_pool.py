@@ -69,21 +69,22 @@ class EdgePooling(torch.nn.Module):
                  merge_method='sum',
                  add_to_edge_score=0.0,
                  conv_first=False,
-                 parallel_matching=False,
+                 matching_mode='greedy',
+                 scoring_mode='mlp',
+                 n_heads=4,
                  ):
         super(EdgePooling, self).__init__()
         self.in_channels = in_channels
         self.out_channels = out_channels
-        # self.conv = torch_geometric.nn.GATConv(2 * in_channels, in_channels)
         self.conv_first = conv_first
-        self.parallel_matching = parallel_matching
+        self.matching_mode = matching_mode
+        self.scoring_mode = scoring_mode
         if edge_score_method == 'softmax':
             edge_score_method = self.compute_edge_score_softmax
         elif edge_score_method == 'sigmoid':
             edge_score_method = self.compute_edge_score_sigmoid
         else:
             edge_score_method = self.compute_edge_score_softmax_full
-
 
         if merge_method == 'cat':
             self.edge_merge = self.merge_edge_cat
@@ -96,20 +97,27 @@ class EdgePooling(torch.nn.Module):
         self.merge_method = merge_method
 
         dim = 2 if merge_method == 'cat' else 1
-        # compute merged embeddings
         self.transform = torch.nn.Linear(dim * in_channels, out_channels)
-        # self.transform_activate = torch.nn.ReLU()
-        # self.transform_2 = torch.nn.Linear(out_channels, out_channels)
-        # self.transform_activate = torch.nn.Sigmoid()
 
-        # scoring layer
-        self.score_net = torch.nn.Linear(out_channels, 1)
+        if scoring_mode == 'attention':
+            self.n_heads = n_heads
+            self.head_dim = max(1, in_channels // n_heads)
+            self.attn_q = torch.nn.Linear(in_channels, self.head_dim * n_heads, bias=False)
+            self.attn_k = torch.nn.Linear(in_channels, self.head_dim * n_heads, bias=False)
+            self.attn_out = torch.nn.Linear(n_heads, 1, bias=False)
+        else:
+            self.score_net = torch.nn.Linear(out_channels, 1)
 
         self.reset_parameters()
 
     def reset_parameters(self):
-        self.score_net.reset_parameters()
         self.transform.reset_parameters()
+        if self.scoring_mode == 'attention':
+            self.attn_q.reset_parameters()
+            self.attn_k.reset_parameters()
+            self.attn_out.reset_parameters()
+        else:
+            self.score_net.reset_parameters()
 
     @staticmethod
     def compute_edge_score_softmax(raw_edge_score, edge_index, num_nodes, batch):
@@ -170,16 +178,24 @@ class EdgePooling(torch.nn.Module):
         # x_merged_self = self.transform_activate(x_merged_self)
         # x_merged_self = self.transform_2(x_merged_self)
 
-        # compute scores for each edge; relu before score_net gives the
-        # two-layer path non-linearity (transform + score_net alone is linear)
-        e = self.score_net(F.relu(x_merged)).view(-1)
+        if self.scoring_mode == 'attention':
+            # multi-head dot-product attention between source and destination nodes
+            q = self.attn_q(x).view(x.size(0), self.n_heads, self.head_dim)
+            k = self.attn_k(x).view(x.size(0), self.n_heads, self.head_dim)
+            q_src = q[edge_index[0]]  # [E, n_heads, head_dim]
+            k_dst = k[edge_index[1]]  # [E, n_heads, head_dim]
+            attn = (q_src * k_dst).sum(dim=-1) / (self.head_dim ** 0.5)  # [E, n_heads]
+            e = self.attn_out(attn).squeeze(-1)  # [E]
+        else:
+            # relu before score_net gives two-layer non-linearity (transform + score_net alone is linear)
+            e = self.score_net(F.relu(x_merged)).view(-1)
         e = F.dropout(e, p=self.dropout, training=self.training)
         e = self.compute_edge_score(e, edge_index, x.size(0), batch)
 
         if dummy:
             e = torch.full(e.shape, .5, dtype=torch.float32, device=e.device)
 
-        if self.parallel_matching:
+        if self.matching_mode == 'luby':
             x_new, edge_index, batch, unpool_info = self.__merge_edges_parallel__(
                 x, edge_index, batch, e, x_merged, x_merged_self)
         else:

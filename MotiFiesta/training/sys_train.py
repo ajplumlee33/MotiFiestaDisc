@@ -21,15 +21,14 @@ class Controller:
         self.since_best_threshold = since_best_threshold
         self.mode = mode
 
-        if mode == 'mot':
-            self.modules = ['rec', 'mot']
-        elif mode == 'sil':
-            self.modules = ['rec', 'sil']
-        else:  # combined
-            self.modules = ['rec', 'mot', 'sil']
+        # sil excluded — noisy regularizer with no convergence criterion.
+        # rec and mot use nan as initial best so since_best increments every
+        # epoch, making each phase run for exactly stop_epochs epochs (timer,
+        # not true early stopping — matches original train.py behavior).
+        self.modules = ['rec', 'mot']
 
         self.best_losses = {
-            key: {'best_loss': float('nan') if key == 'rec' else float('inf'), 'since_best': 0}
+            key: {'best_loss': float('nan'), 'since_best': 0}
             for key in self.modules
         }
 
@@ -104,6 +103,7 @@ def sys_train(model,
                 estimator='knn',
                 epochs=200,
                 lam=1,
+                sil_lam=1.0,
                 beta=1,
                 max_batches=-1,
                 stop_epochs=30,
@@ -133,11 +133,10 @@ def sys_train(model,
     :param edge_sample_rate: fraction of (i,j) entries used for rec supervision
     """
     start_time = time.time()
-    n_feat = source_graph.num_features if hasattr(source_graph, 'num_features') else None
-    device = get_device(n_features=n_feat)
+    device = get_device(n_features=model.hidden_dim)
 
     # fix the rng trajectory so runs are reproducible
-    torch.manual_seed(0)
+    torch.manual_seed(42)
 
     os.makedirs(f'models/{model_name}', exist_ok=True)
     writer = SummaryWriter(f"logs/{model_name}")
@@ -208,7 +207,7 @@ def sys_train(model,
                 warmup_done = True
 
             if warmup_done:
-                if mode in ('mot', 'combined') and controller.keep_going('mot'):
+                if mode in ('mot', 'combined'):
                     neg = _make_neg(pos)
                     with torch.no_grad():
                         xx_neg, pp_neg, ee_neg, _, merge_info_neg, internals_neg = _forward(model, neg, device)
@@ -227,12 +226,12 @@ def sys_train(model,
                     mot_loss_tot += mot_loss.item()
                     backward = True
 
-                if mode in ('sil', 'combined') and controller.keep_going('mot') and controller.keep_going('sil'):
+                if mode in ('sil', 'combined'):
                     sil_loss = model.sil_loss(internals_pos,
                                               merge_info_pos,
                                               sil_tracker,
                                               momentum=sil_momentum)
-                    loss += sil_loss * lam
+                    loss += sil_loss * sil_lam
                     sil_loss_tot += sil_loss.item()
                     backward = True
 
@@ -292,7 +291,7 @@ def sys_train(model,
                 warmup_done = True
 
             if warmup_done:
-                if mode in ('mot', 'combined') and controller.keep_going('mot'):
+                if mode in ('mot', 'combined'):
                     neg = _make_neg(pos)
                     with torch.no_grad():
                         xx_neg, pp_neg, ee_neg, _, merge_info_neg, internals_neg = _forward(model, neg, device)
@@ -308,7 +307,7 @@ def sys_train(model,
                                                beta=beta
                                                )
 
-                if mode in ('sil', 'combined') and controller.keep_going('mot') and controller.keep_going('sil'):
+                if mode in ('sil', 'combined'):
                     sil_loss = model.sil_loss(internals_pos,
                                               merge_info_pos,
                                               sil_tracker,

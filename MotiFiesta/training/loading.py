@@ -62,15 +62,31 @@ def get_loader(root,
         print("systems-level graph detected: skipping dataset split")
         # calculate split indices
         num_nodes = dataset[0].num_nodes
-        indices = torch.randperm(num_nodes)
+        indices = torch.randperm(num_nodes, generator=torch.Generator().manual_seed(42))
         split_idx = int(num_nodes * 0.8)
 
-        train_idx = indices[:split_idx]
+        # degree-biased seed sampling: high-degree nodes (motif nodes) are
+        # sampled as seeds proportionally more often, so training batches are
+        # more frequently centered on motif instances. test and decode loaders
+        # stay uniform so evaluation is unbiased.
+        data = dataset[0]
+        degrees = data.edge_index[0].bincount(minlength=num_nodes).float()
+        train_idx = torch.multinomial(
+            degrees + 1.0,
+            num_samples=split_idx,
+            replacement=True,
+            generator=torch.Generator().manual_seed(42),
+        )
         test_idx = indices[split_idx:]
 
-        loader_train = SysLoader(dataset[0], input_nodes=train_idx, batch_size=batch_size, shuffle=True)
-        loader_test = SysLoader(dataset[0], input_nodes=test_idx, batch_size=batch_size, shuffle=True)
-        loader = SysLoader(dataset[0], batch_size=batch_size, shuffle=False)
+        # num_neighbors matches motif_size so each batch centered on a motif
+        # seed captures exactly one complete motif instance at hop-1.
+        motif_size = int(kwargs.get('motif_size', 10))
+        num_neighbors = [motif_size - 1, 0]
+
+        loader_train = SysLoader(dataset[0], input_nodes=train_idx, batch_size=batch_size, num_neighbors=num_neighbors, shuffle=True)
+        loader_test = SysLoader(dataset[0], input_nodes=test_idx, batch_size=batch_size, num_neighbors=num_neighbors, shuffle=True)
+        loader = SysLoader(dataset[0], batch_size=batch_size, num_neighbors=num_neighbors, shuffle=False)
     else:
         lengths = [math.floor(len(dataset) * .8), math.ceil(len(dataset) * .2)]
         train_data, test_data = random_split(dataset, lengths, generator=torch.Generator().manual_seed(42))

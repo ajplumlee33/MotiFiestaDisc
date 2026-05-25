@@ -32,8 +32,8 @@ from torch_geometric.data import Data, DataLoader
 from torch_geometric.utils import from_networkx
 from torch_geometric.utils import to_networkx
 
-random.seed(0)
-np.random.seed(0)
+random.seed(42)
+np.random.seed(42)
 
 def rewire(g_pyg, n_iter=100):
     """ Apply (u, v), (u', v') --> (u, v'), (v, u') to randomize graph.
@@ -62,7 +62,7 @@ class RealWorldDataset(Dataset):
                  root="ENZYMES",
                  n_swap=100,
                  transform=None,
-                 seed=0,
+                 seed=42,
                  max_degree=100,
                  n_features=None):
         """ Builds the synthetic motif dataset. Motifs are built on the

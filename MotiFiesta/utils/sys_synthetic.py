@@ -97,23 +97,29 @@ class SysSyntheticDataset(Dataset):
         # load processed graph once and build igraph
         self.cached_data = torch.load(self.processed_paths[0], weights_only=False)
 
-        # warn if caller's params differ from what was stored at generation time.
-        # does not block loading (cached data is used regardless); exists to
-        # catch cases where a regeneration overwrote a dataset with wrong params.
+        # block loading if structural params differ from what was stored at generation time.
+        # seed mismatch is ignorable (pre-generated dataset reuse); everything else is not.
         stored = self._stored_params()
         if stored is not None:
             cur = self._current_params()
             mismatches = {k: (stored.get(k), cur[k]) for k in cur if stored.get(k) != cur[k]}
             if mismatches:
-                import warnings
-                warnings.warn(
-                    f"SysSyntheticDataset: loaded cached data from {self.processed_dir!r} "
-                    f"but caller params differ from generation params. "
-                    f"Mismatches: {mismatches}. "
-                    f"If this is intentional (pre-generated dataset), ignore this warning. "
-                    f"If not, delete the processed directory and regenerate.",
-                    UserWarning, stacklevel=2,
-                )
+                structural = {k: v for k, v in mismatches.items() if k != 'seed'}
+                seed_only = {k: v for k, v in mismatches.items() if k == 'seed'}
+                if structural:
+                    raise ValueError(
+                        f"SysSyntheticDataset: cached data at {self.processed_dir!r} was generated "
+                        f"with different structural params: {structural}. "
+                        f"Delete the processed directory and regenerate."
+                    )
+                if seed_only:
+                    import warnings
+                    warnings.warn(
+                        f"SysSyntheticDataset: loaded cached data from {self.processed_dir!r} "
+                        f"but caller seed differs from generation seed: {seed_only}. "
+                        f"If this is intentional (pre-generated dataset), ignore this warning.",
+                        UserWarning, stacklevel=2,
+                    )
         edges = self.cached_data.edge_index.t().tolist()
         self.ig_graph = Graph(
             n=self.cached_data.num_nodes,
@@ -214,11 +220,6 @@ class SysSyntheticDataset(Dataset):
         # build parent ER graph directly — no max_degree retry loop
         G = nx.erdos_renyi_graph(self.parent_size, self.parent_e_prob,
                                  seed=self.seed)
-        if not nx.is_connected(G):
-            comps = list(nx.connected_components(G))
-            rep = next(iter(comps[0]))
-            for comp in comps[1:]:
-                G.add_edge(rep, next(iter(comp)))
 
         nx.set_node_attributes(G, 0, 'is_motif')
         nx.set_node_attributes(G, 0, 'motif_id')
@@ -321,7 +322,7 @@ if __name__ == "__main__":
         parent_size=80,
         parent_e_prob=0.05,
         distort_p=0.0,
-        seed=0,
+        seed=42,
     )
     d = ds[0]
     print(f"motif_type      : {ds.motif_type} (size={ds.motif_size})")
@@ -350,7 +351,7 @@ if __name__ == "__main__":
         parent_size=120,
         parent_e_prob=0.05,
         distort_p=0.0,
-        seed=0,
+        seed=42,
     )
     d = ds[0]
     print(f"motif_type      : {ds.motif_type}")
