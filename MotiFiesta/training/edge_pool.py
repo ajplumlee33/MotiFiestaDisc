@@ -1,6 +1,7 @@
 import random
 from collections import namedtuple
 
+import networkx as nx
 import torch
 from torch_geometric.data import Data
 import torch.nn.functional as F
@@ -106,7 +107,13 @@ class EdgePooling(torch.nn.Module):
             self.attn_k = torch.nn.Linear(in_channels, self.head_dim * n_heads, bias=False)
             self.attn_out = torch.nn.Linear(n_heads, 1, bias=False)
         else:
-            self.score_net = torch.nn.Linear(out_channels, 1)
+            # +3: cn, degree product, k-core product (structural signals, score path only)
+            score_in = out_channels + 3
+            self.score_net = torch.nn.Sequential(
+                torch.nn.Linear(score_in, score_in),
+                torch.nn.ReLU(),
+                torch.nn.Linear(score_in, 1),
+            )
 
         self.reset_parameters()
 
@@ -117,7 +124,9 @@ class EdgePooling(torch.nn.Module):
             self.attn_k.reset_parameters()
             self.attn_out.reset_parameters()
         else:
-            self.score_net.reset_parameters()
+            for m in self.score_net.modules():
+                if isinstance(m, torch.nn.Linear):
+                    m.reset_parameters()
 
     @staticmethod
     def compute_edge_score_softmax(raw_edge_score, edge_index, num_nodes, batch):
@@ -150,16 +159,18 @@ class EdgePooling(torch.nn.Module):
         batch = batch.to(X.device)
         return global_add_pool(X, batch)
 
-    def forward(self, x, edge_index, batch, hard_embed=False, dummy=False):
+    def forward(self, x, edge_index, batch, hard_embed=False, dummy=False, x_score=None):
         r"""Forward computation which computes the raw edge score, normalizes
         it, and merges the edges.
 
         Args:
-            x (Tensor): The node features.
+            x (Tensor): The node features used for the hash embedding (transform path).
             edge_index (LongTensor): The edge indices.
             batch (LongTensor): Batch vector
                 :math:`\mathbf{b} \in {\{ 0, \ldots, B-1\}}^N`, which assigns
                 each node to a specific example.
+            x_score (Tensor, optional): If provided, used instead of x for
+                score_net input (dual-pathway: separate scoring and embedding streams).
 
         Return types:
             * **x** *(Tensor)* - The pooled node features.
@@ -168,27 +179,50 @@ class EdgePooling(torch.nn.Module):
             * **unpool_info** *(unpool_description)* - Information that is
               consumed by :func:`EdgePooling.unpool` for unpooling.
         """
-        x_merged = self.edge_merge(x, edge_index)
-        x_merged = self.transform(x_merged)
+        raw = self.edge_merge(x, edge_index)
+        x_merged = self.transform(raw)
 
-        # compute features for each node with itself in case node is not pooled
         e_ind_self = torch.tensor([list(range(len(x))), list(range(len(x)))], device=x.device)
-        x_merged_self = self.edge_merge(x, e_ind_self)
-        x_merged_self = self.transform(x_merged_self)
-        # x_merged_self = self.transform_activate(x_merged_self)
-        # x_merged_self = self.transform_2(x_merged_self)
+        raw_self = self.edge_merge(x, e_ind_self)
+        x_merged_self = self.transform(raw_self)
 
         if self.scoring_mode == 'attention':
-            # multi-head dot-product attention between source and destination nodes
-            q = self.attn_q(x).view(x.size(0), self.n_heads, self.head_dim)
-            k = self.attn_k(x).view(x.size(0), self.n_heads, self.head_dim)
-            q_src = q[edge_index[0]]  # [E, n_heads, head_dim]
-            k_dst = k[edge_index[1]]  # [E, n_heads, head_dim]
-            attn = (q_src * k_dst).sum(dim=-1) / (self.head_dim ** 0.5)  # [E, n_heads]
-            e = self.attn_out(attn).squeeze(-1)  # [E]
+            x_attn = x_score if x_score is not None else x
+            q = self.attn_q(x_attn).view(x_attn.size(0), self.n_heads, self.head_dim)
+            k = self.attn_k(x_attn).view(x_attn.size(0), self.n_heads, self.head_dim)
+            q_src = q[edge_index[0]]
+            k_dst = k[edge_index[1]]
+            attn = (q_src * k_dst).sum(dim=-1) / (self.head_dim ** 0.5)
+            e = self.attn_out(attn).squeeze(-1)
         else:
-            # relu before score_net gives two-layer non-linearity (transform + score_net alone is linear)
-            e = self.score_net(F.relu(x_merged)).view(-1)
+            with torch.no_grad():
+                num_nodes = x.size(0)
+                adj = torch.zeros(num_nodes, num_nodes, device=x.device)
+                adj[edge_index[0], edge_index[1]] = 1.0
+                # common-neighbor count: high for clique edges, near-0 for sparse background
+                cn = (adj @ adj)[edge_index[0], edge_index[1]].unsqueeze(-1)
+                cn = torch.log1p(cn)
+                # degree product: high when both endpoints are hubs (clique nodes)
+                deg = adj.sum(dim=1)
+                dp = (deg[edge_index[0]] * deg[edge_index[1]]).unsqueeze(-1)
+                dp = torch.log1p(dp)
+                # k-core number per node: 9-core for K10 clique nodes, low for background
+                ei_cpu = edge_index.cpu()
+                G = nx.Graph()
+                G.add_nodes_from(range(x.size(0)))
+                G.add_edges_from(zip(ei_cpu[0].tolist(), ei_cpu[1].tolist()))
+                core = nx.core_number(G)
+                core_t = torch.tensor([core[i] for i in range(x.size(0))],
+                                      dtype=torch.float32, device=x.device)
+                kc = (core_t[edge_index[0]] * core_t[edge_index[1]]).unsqueeze(-1)
+                kc = torch.log1p(kc)
+            # dual pathway: use gin-enriched edge features for scoring if provided
+            if x_score is not None:
+                raw_score = self.edge_merge(x_score, edge_index)
+                x_for_score = raw_score
+            else:
+                x_for_score = x_merged
+            e = self.score_net(torch.cat([F.relu(x_for_score), cn, dp, kc], dim=-1)).view(-1)
         e = F.dropout(e, p=self.dropout, training=self.training)
         e = self.compute_edge_score(e, edge_index, x.size(0), batch)
 
@@ -242,10 +276,10 @@ class EdgePooling(torch.nn.Module):
             if target not in nodes_remaining:
                 continue
 
-            # print(f"merged score: ", edge_score[edge_idx])
             merge_count += 1
-            # emb_cat.append(torch.cat((x[source], x[target])))
-            emb_cat.append(x_merged[edge_idx])
+            e_sc = edge_score[edge_idx]
+            ste_gate = e_sc + (1.0 - e_sc).detach()
+            emb_cat.append(x_merged[edge_idx] * ste_gate)
             new_edge_indices.append(edge_idx)
 
             cluster[source] = i
@@ -443,7 +477,9 @@ class EdgePooling(torch.nn.Module):
 
         if selected_per_round:
             merged_idx_all = torch.cat(selected_per_round)
-            merged_embeddings = x_merged[merged_idx_all]
+            ste_scores = edge_score[merged_idx_all]
+            ste_gate = ste_scores + (1.0 - ste_scores).detach()
+            merged_embeddings = x_merged[merged_idx_all] * ste_gate.unsqueeze(-1)
         else:
             merged_idx_all = torch.empty(0, dtype=torch.long, device=device)
             merged_embeddings = torch.empty(0, x_merged.size(1), device=device)

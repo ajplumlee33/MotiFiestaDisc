@@ -43,10 +43,62 @@ def load_model(run, permissive=False, verbose=True):
         model_dict = torch.load(f'models/{run}/{run}.pth',
                                 map_location='cpu')
         state_dict = model_dict['model_state_dict']
+
+        # backward compat: dual-proj checkpoints used transform_hi/transform_lo;
+        # remap transform_hi → transform and drop transform_lo / gate_net
+        if any('.transform_hi.weight' in k for k in state_dict):
+            fresh = model.state_dict()
+            remapped = {}
+            for k, v in state_dict.items():
+                if '.transform_hi.' in k:
+                    remapped[k.replace('.transform_hi.', '.transform.')] = v
+                elif '.transform_lo.' in k or '.gate_net.' in k:
+                    pass  # discard dual-proj-only keys
+                else:
+                    remapped[k] = v
+            for k in fresh:
+                if k not in remapped:
+                    remapped[k] = fresh[k]
+            state_dict = remapped
+
+        # drop score_net keys if architecture changed (sequential vs linear, or size mismatch)
+        # fresh init is fine since score_net weights are not transferable across architectures
+        cur_layer = model.layers[0]
+        ckpt_has_linear = 'layers.0.score_net.weight' in state_dict
+        ckpt_has_seq = 'layers.0.score_net.0.weight' in state_dict
+        cur_is_seq = isinstance(cur_layer.score_net, torch.nn.Sequential)
+        fresh = model.state_dict()
+        needs_fresh_score_net = False
+        if (ckpt_has_linear and cur_is_seq) or (ckpt_has_seq and not cur_is_seq):
+            needs_fresh_score_net = True
+        elif ckpt_has_linear:
+            ckpt_in = state_dict['layers.0.score_net.weight'].shape[1]
+            cur_in = cur_layer.score_net.weight.shape[1]
+            if ckpt_in != cur_in:
+                needs_fresh_score_net = True
+        if needs_fresh_score_net:
+            for k in list(state_dict.keys()):
+                if 'score_net' in k:
+                    del state_dict[k]
+            for k, v in fresh.items():
+                if 'score_net' in k:
+                    state_dict[k] = v
+
+        # replace any remaining checkpoint keys whose shape doesn't match current model
+        # (e.g. pool_layers.0.transform after dual-pathway arch change: dim×dim → dim×n_features)
+        for k in list(state_dict.keys()):
+            if k in fresh and state_dict[k].shape != fresh[k].shape:
+                if verbose:
+                    print(f"shape mismatch for {k}: ckpt {state_dict[k].shape} vs model {fresh[k].shape} — using fresh init")
+                state_dict[k] = fresh[k]
+
         model.load_state_dict(state_dict)
 
         optimizer = torch.optim.Adam(model.parameters())
-        optimizer.load_state_dict(model_dict['optimizer_state_dict'])
+        try:
+            optimizer.load_state_dict(model_dict['optimizer_state_dict'])
+        except (ValueError, KeyError):
+            pass  # architecture changed; fresh optimizer is fine for inference
 
     except FileNotFoundError:
         if not permissive:
@@ -63,8 +115,18 @@ def dump_model_hparams(name, hparams):
     pass
 
 def model_from_json(params):
-    from MotiFiesta.training.model import MotiFiestaModel
-    model = MotiFiestaModel(**params['model'])
+    model_params = dict(params['model'])
+    model_type = model_params.pop('model_type', 'motifiesta')
+    # backward compat: old checkpoints used parallel_matching bool
+    if 'parallel_matching' in model_params:
+        val = model_params.pop('parallel_matching')
+        model_params.setdefault('matching_mode', 'luby' if val else 'greedy')
+    if model_type == 'disc':
+        from MotiFiesta.training.disc_model import DiscModel
+        model = DiscModel(**model_params)
+    else:
+        from MotiFiesta.training.model import MotiFiestaModel
+        model = MotiFiestaModel(**model_params)
     return model
 
 def dataset_from_json(params, background=False):

@@ -247,9 +247,6 @@ def motif_train(model,
                                                                                   edge_index_neg,
                                                                                   batch_neg.batch
                                                                                   )
-                wl_weights = compute_wl_cross_weights(
-                    batch_pos, batch_neg, ee_pos, merge_info_pos, wl_iter=wl_iter,
-                )
                 mot_loss = model.freq_loss(internals_pos,
                                            internals_neg,
                                            pp_pos,
@@ -259,9 +256,7 @@ def motif_train(model,
                                            k=n_neighbors,
                                            lam=lam,
                                            beta=beta,
-                                           wl_weights=wl_weights,
                                            )
-
                 loss += mot_loss
                 mot_loss_tot += mot_loss.item()
                 backward = True
@@ -323,9 +318,6 @@ def motif_train(model,
                                                                                       edge_index_neg,
                                                                                       batch_neg.batch
                                                                                       )
-                    wl_weights = compute_wl_cross_weights(
-                        batch_pos, batch_neg, ee_pos, merge_info_pos, wl_iter=wl_iter,
-                    )
                 mot_loss = model.freq_loss(internals_pos,
                                            internals_neg,
                                            pp_pos,
@@ -335,7 +327,6 @@ def motif_train(model,
                                            k=n_neighbors,
                                            lam=lam,
                                            beta=beta,
-                                           wl_weights=wl_weights,
                                            )
 
 
