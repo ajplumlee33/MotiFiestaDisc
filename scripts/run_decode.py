@@ -1,83 +1,37 @@
 """
-decode the trained model on the synthetic clique dataset and write outputs to
-decoded/{MODEL_ID}/. decode log is also written to logs/{MODEL_ID}/decode.log.
+decode the trained BFS model using the original HashDecoder and evaluate
+with the original node-level permutation M-Jaccard.
 
-run from the repo root:
+run from repo root:
     python scripts/run_decode.py
 """
-import os
-from MotiFiesta.training.disc_decode import DiscHashDecoder
+from MotiFiesta.training.decode import HashDecoder
 
-MODEL_ID = 'sys_synth-clique-com-luby-mlp-p0.002-n1000-k10-d0.00-sil-b256'
-DATASET_ID = 'sys_synth-clique-p0.002-n1000-k10-d0.00'
-DATASET_ROOT = 'data/sys_synth-clique-p0.002-n1000-k10-d0.00'
-OUT_DIR = f'decoded/{MODEL_ID}'
-LOG_DIR = f'logs/{MODEL_ID}'
-
-
-DATASET_KWARGS = dict(
-    distort_p=0.0,
-    parent_e_prob=0.002,
-    motif_type='clique',
-    motif_size=10,
-    n_motifs=20,
-    parent_size=1000,
-)
+MODEL_ID     = 'louvain_clique_k10_wl_crossweight_filtered'
+DATASET_ROOT = 'data/louvain_decomp-clique-p0.05-n500-k10-d0.00'
+LEVEL        = 4
+HASH_DIM     = 8
+TOP_K        = 1
 
 
 def main():
-    os.makedirs(LOG_DIR, exist_ok=True)
-    log_path = os.path.join(LOG_DIR, 'decode.log')
-
-    decoder = DiscHashDecoder(
+    decoder = HashDecoder(
         model_id=MODEL_ID,
-        dataset_id=DATASET_ID,
-        dataset_root=DATASET_ROOT,
-        level=4,
-        hash_dim=8,
-        batch_size=64,
-        **DATASET_KWARGS,
+        dataset_id=DATASET_ROOT,
+        hash_dim=HASH_DIM,
+        level=LEVEL,
     )
 
     for layer in decoder.model.layers:
-        layer.matching_mode = 'luby'
+        layer.parallel_matching = True
 
-    results = decoder.decode()
+    decoded_graphs = decoder.decode()
 
-    lines = []
+    jaccard = decoder.eval(decoded_graphs, n_motifs=1, top_k=TOP_K)
+    print(f"\nM-Jaccard (top_k={TOP_K}): {jaccard:.4f}")
 
-    lines.append("\n=== pre-filter diagnostics ===")
-    diag = decoder.diagnose(results)
-
-    # k=1 is the paper metric (top-1 sigma bucket vs all true motif nodes).
-    # k=N shows the upper bound — best single bucket over all candidates.
-    n = diag['total_spotlights']
-    lines.append("\n=== multi-k eval (K=1 is paper metric, K=N is upper bound) ===")
-    for k in [1, 4, n]:
-        ev = decoder.eval(results, top_k=k, min_size=1, max_size=999)
-        lines.append(f"  K={k:3d}  jaccard={ev['jaccard']:.4f}  instance_recall={ev['instance_recall']:.4f}")
-
-    lines.append("\n=== top motifs ===")
-    out = decoder.export_all(
-        results,
-        out_dir=OUT_DIR,
-        top_n=10,
-        min_size=5,
-        max_size=50,
-        require_connected=False,
-        min_instances=1,
-        rank_by='total_score',
-    )
-
-    lines.append(f"\ncollection file : {out['collection']}")
-    lines.append(f"input graph     : {out['input_graph']}")
-    lines.append(f"queries file    : {out['queries']}")
-
-    output = "\n".join(lines)
-    print(output)
-    with open(log_path, 'w') as f:
-        f.write(output + "\n")
-    print(f"\ndecode log      : {log_path}")
+    mot_sigma = decoder.motif_sigma(decoded_graphs)
+    print(f"motif sigma by class: {mot_sigma}")
 
 
 if __name__ == "__main__":

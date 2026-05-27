@@ -9,8 +9,9 @@ from torch_geometric.data import DataLoader
 from MotiFiesta.utils.synthetic import SyntheticMotifs
 from MotiFiesta.utils.real_world import RealWorldDataset
 from MotiFiesta.utils.sys_txt import SysTxtDataset
-from MotiFiesta.utils.sys_synthetic import SysSyntheticDataset  # NEW
+from MotiFiesta.utils.sys_synthetic import SysSyntheticDataset
 from MotiFiesta.utils.sys_loader import SysLoader
+from MotiFiesta.utils.bfs_decompose import BFSDecomposedDataset, LouvainDecomposedDataset
 
 
 def get_loader(root,
@@ -33,7 +34,19 @@ def get_loader(root,
         Dictionary with loaders and datasets for train/test
 
     """
-    if 'mips_torch' in root:
+    if 'bfs_decomp' in root or 'louvain_decomp' in root:
+        cache = os.path.join(root, 'processed', 'data_0.pt')
+        if not os.path.exists(cache):
+            raise FileNotFoundError(
+                f"no decomposed cache at {cache} — run scripts/build_data_bfs.py first"
+            )
+        if 'louvain_decomp' in root:
+            print(">>> SUCCESS: Louvain-decomposed dataset detected")
+            dataset = LouvainDecomposedDataset(root=root)
+        else:
+            print(">>> SUCCESS: BFS-decomposed dataset detected")
+            dataset = BFSDecomposedDataset(root=root)
+    elif 'mips_torch' in root:
         print(">>> SUCCESS: Systems dataset detected")
         dataset = SysTxtDataset(root=root)
     elif 'sys_synth' in root:
@@ -43,8 +56,8 @@ def get_loader(root,
         # branches, and forwarding them blindly would TypeError here.
         print(">>> SUCCESS: Synthetic systems dataset detected")
         _synth_keys = ('motif_type', 'motif_size', 'n_motifs',
-                       'parent_size', 'parent_e_prob', 'random_e_prob',
-                       'distort_p', 'seed', 'max_degree', 'n_features')
+                       'parent_size', 'parent_e_prob', 'distort_p',
+                       'seed')
         _synth_kwargs = {k: kwargs[k] for k in _synth_keys if k in kwargs}
         dataset = SysSyntheticDataset(root=root, **_synth_kwargs)
     else:
