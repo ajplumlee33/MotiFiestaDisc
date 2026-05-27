@@ -240,7 +240,7 @@ if __name__ == "__main__":
     # ----- speed comparison on a realistic-ish batch -----
     print("\nspeed: 20 small random graphs (simulates one pool level):")
     n_graphs = 20
-    rng = torch.Generator().manual_seed(0)
+    rng = torch.Generator().manual_seed(42)
 
     edge_list, count_list, label_list = [], [], []
     for _ in range(n_graphs):

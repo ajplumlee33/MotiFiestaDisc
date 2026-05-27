@@ -23,7 +23,7 @@ def main():
     )
 
     for layer in decoder.model.layers:
-        layer.parallel_matching = True
+        layer.matching_mode = 'luby'
 
     decoded_graphs = decoder.decode()
 
