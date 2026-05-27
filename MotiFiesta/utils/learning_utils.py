@@ -4,32 +4,22 @@ import json
 import torch
 
 device_cache = None
-_GPU_FEATURE_THRESHOLD = 32  # min n_features to justify gpu/mps overhead
 
 def set_device(device):
     """override device selection. call before training to lock in a device."""
     global device_cache
     device_cache = torch.device(device) if not isinstance(device, torch.device) else device
 
-def get_device(n_features=None):
-    """return the active compute device.
-
-    if set_device() was called previously, returns that device.
-    if n_features is provided and below _GPU_FEATURE_THRESHOLD, returns cpu.
-    otherwise prefers cuda > mps > cpu.
-    """
+def get_device():
+    """return the active compute device: cuda > cpu (mps skipped — slower for small sparse graphs)."""
     global device_cache
     if device_cache is not None:
         return device_cache
-    if n_features is not None and n_features < _GPU_FEATURE_THRESHOLD:
-        device_cache = torch.device("cpu")
-        return device_cache
     if torch.cuda.is_available():
         device_cache = torch.device("cuda")
-    elif torch.backends.mps.is_available():
-        device_cache = torch.device("mps")
     else:
         device_cache = torch.device("cpu")
+    print(f"using device: {device_cache}")
     return device_cache
 
 def load_data(run, batch_size=2, background_only=False):

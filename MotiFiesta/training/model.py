@@ -124,10 +124,31 @@ class MotiFiestaModel(torch.nn.Module):
             x = out['new_graph']['x_new']
             batch = out['new_graph']['batch_new']
 
+        from collections import defaultdict
+
+        # spotlights[t][s] = set of original node indices in supernode s at level t
+        spotlights = []
+        for sa in spotlight_assignment:
+            spot_t = defaultdict(set)
+            for node_idx, sup_id in enumerate(sa.tolist()):
+                spot_t[sup_id].add(node_idx)
+            spotlights.append(spot_t)
+
+        # tree[t][s] = set of level-(t-1) supernodes that merged into s at level t
+        # tree[0] is empty (base case for recursion in HashDecoder.total_sigma)
+        tree = [defaultdict(set)]
+        for cluster in cluster_chain:
+            tree_t = defaultdict(set)
+            for child_id, parent_id in enumerate(cluster.tolist()):
+                tree_t[parent_id].add(child_id)
+            tree.append(tree_t)
+
         merge_info = {
             'spotlight_assignment': spotlight_assignment,
             'cluster_chain': cluster_chain,
             'n_id': n_id,
+            'spotlights': spotlights,
+            'tree': tree,
         }
 
         return xx, pp, ee, batches, merge_info, internals
@@ -349,13 +370,17 @@ class MotiFiestaModel(torch.nn.Module):
                  steps=3,
                  volume=False,
                  k=30,
+                 wl_weights=None,
                  ):
         """ Penalize embeddings that are close to randos or sparse. """
-        tot_loss = 0
-        for t in range(len(pp)):
-            x_pos = internals_pos[t]['x_merged']
-            x_neg = internals_neg[t]['x_merged']
+        device = next(self.parameters()).device
+        tot_loss = None
+        for t in range(min(len(pp), len(internals_neg))):
+            # l2-normalize so knn distances are bounded to [0, 2] regardless of embedding scale
+            x_pos = F.normalize(internals_pos[t]['x_merged'], dim=-1)
+            x_neg = F.normalize(internals_neg[t]['x_merged'], dim=-1)
             s = pp[t]
+            w = wl_weights[t].to(device) if (wl_weights is not None and t < len(wl_weights)) else None
 
             # cap to bound cdist cost: as training progresses neg graphs collapse
             # less (lower edge scores for background), causing x_neg to grow.
@@ -364,6 +389,8 @@ class MotiFiestaModel(torch.nn.Module):
                 perm = torch.randperm(x_pos.size(0), device=x_pos.device)[:max_e]
                 x_pos = x_pos[perm]
                 s = s[perm]
+                if w is not None:
+                    w = w[perm]
             if x_neg.size(0) > max_e:
                 perm = torch.randperm(x_neg.size(0), device=x_neg.device)[:max_e]
                 x_neg = x_neg[perm]
@@ -379,31 +406,28 @@ class MotiFiestaModel(torch.nn.Module):
             if estimator == 'knn':
                 density_pos = self.distance_density(x_pos, x_pos, k=k_eff)
                 density_neg = self.distance_density(x_pos, x_neg, k=k_eff)
-
-                # normalize to [0, 1] as the f_pos/f_neg comment below assumes
-                scale = torch.cat([density_pos, density_neg]).max() + 1e-8
-                density_pos = density_pos / scale
-                density_neg = density_neg / scale
             if estimator == 'min':
                 density_pos = self.min_density(x_pos, x_pos)
                 density_neg = self.min_density(x_pos, x_neg)
 
-
             f_pos = density_pos.view(-1, 1).squeeze()
             f_neg  = density_neg.view(-1, 1).squeeze()
 
-            # f_pos and f_neg are [0, 1]. When density is high f -> 0, 1 else
             # f_pos - f_neg -> -1 with motifs (f_p = 0, f_n = 1)
             # f_pos - f_neg -> 1 with non-motifs (f_p = 1, f_n=0)
-            l = (-1 * s * torch.exp(-1 * beta * (f_pos - f_neg))).mean()
+            if w is not None:
+                l = (-1 * w * s * torch.exp(-1 * beta * (f_pos - f_neg))).mean()
+            else:
+                l = (-1 * s * torch.exp(-1 * beta * (f_pos - f_neg))).mean()
 
             reg_term = lam * s.pow(2.0).mean()
             l += reg_term
 
-            tot_loss += l
+            tot_loss = l if tot_loss is None else tot_loss + l
 
-        tot_loss /= steps
-        return tot_loss
+        if tot_loss is None:
+            return torch.zeros(1, device=device, requires_grad=True).squeeze()
+        return tot_loss / steps
 
     def sil_loss(self, internals_pos, merge_info, tracker, momentum=0.95,
                  max_per_level=100):

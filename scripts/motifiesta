@@ -1,4 +1,4 @@
-#!/urs/bin/env/ python
+#!/usr/bin/env python
 
 import sys
 import pickle
@@ -11,7 +11,6 @@ warnings.simplefilter("ignore", UserWarning)
 from MotiFiesta.training.model import MotiFiestaModel
 from MotiFiesta.training.loading import get_loader
 from MotiFiesta.training.train import motif_train
-from MotiFiesta.training.sys_train import sys_train
 from MotiFiesta.utils.learning_utils import dump_model_hparams
 from MotiFiesta.utils.learning_utils import load_model
 from MotiFiesta.utils.learning_utils import load_data
@@ -34,6 +33,7 @@ if function == 'train':
     parser.add_argument("--dataset", "-da", type=str, default='synthetic')
     parser.add_argument("--data_root", type=str, default='.')
     parser.add_argument("--restart", "-r", action='store_true', default=False,  help='Restart model.')
+    parser.add_argument("--init-from", type=str, default=None, help='Load weights from this model name, start fresh optimizer and controller (staged training).')
     parser.add_argument("--disc", "-di", action='store_true', default=False,  help='Discovery mode.')
     parser.add_argument("--mode", "-md", default='combined',
                         choices=['mot', 'sil', 'combined'],
@@ -41,7 +41,7 @@ if function == 'train':
 
     parser.add_argument("--batch-size", "-b", type=int, default=16)
     parser.add_argument("--max-batches", "-m", type=int, default=-1)
-    parser.add_argument("--epochs", "-e", type=int, default=200)
+    parser.add_argument("--epochs", "-e", type=int, default=100)
     parser.add_argument("--stop-epochs", type=int, default=30, help="Number of epochs to train embeddings before doing motifs.")
     parser.add_argument("--attributed", default=False, action='store_true', help="Use attributed graphs. If False, use node degree as features.")
 
@@ -53,6 +53,7 @@ if function == 'train':
     parser.add_argument("--volume", "-vv", action='store_true', default=False, help="Use d-sphere volume to normalize density with kNN.")
     parser.add_argument('--rec-kernel', choices=['wwl', 'wl'], default='wl')
     parser.add_argument('--edge-sample-rate', type=float, default=1.0)
+    parser.add_argument('--wl-iter', type=int, default=3, help="WL subtree iterations for rec_loss_wl")
     parser.add_argument("--sil-momentum", type=float, default=0.95,
                         help="EMA momentum for the sampling invariance tracker (higher = more stable targets)")
 
@@ -63,6 +64,7 @@ if function == 'train':
     parser.add_argument("--merge-method", default="sum", help="Edge merge method: (sum, cat, set2set)")
     parser.add_argument("--hard-embed", action='store_true', help="Whether to use hard embedding using degree histogram.")
     parser.add_argument("--parallel-matching", action='store_true', default=False, help="Use Luby parallel matching in EdgePooling layers.")
+    parser.add_argument("--device", type=str, default=None, help="Force compute device: cpu, cuda, mps.")
 
     # --- Synthetic single-graph dataset flags (used only when data_root --
     # contains 'sys_synth'; silently ignored otherwise) -----------------------
@@ -95,6 +97,10 @@ if function == 'train':
 
     args, _ = parser.parse_known_args()
     print(args)
+
+    from MotiFiesta.utils.learning_utils import set_device
+    if args.device is not None:
+        set_device(args.device)
 
     make_dirs(args.name)
 
@@ -163,50 +169,33 @@ if function == 'train':
         epoch_start = model_dict['epoch']
         optimizer = model_dict['optimizer']
         controller_state = model_dict['controller_state_dict']
+    elif args.init_from:
+        print(f"Initializing weights from: {args.init_from}")
+        model_dict = load_model(args.init_from)
+        model = model_dict['model']
+        epoch_start, optimizer, controller_state = 0, None, None
     else:
         model = MotiFiestaModel(**hparams['model'])
         epoch_start, optimizer, controller_state = 0, None, None
     print(model)
 
     print(">>> training...")
-    if not args.disc:
-        motif_train(model,
-                    train_loader=data['loader_train'],
-                    test_loader=data['loader_test'],
-                    model_name=args.name,
-                    epochs=args.epochs,
-                    max_batches=args.max_batches,
-                    stop_epochs=args.stop_epochs,
-                    estimator=args.estimator,
-                    volume=args.volume,
-                    n_neighbors=args.n_neighbors,
-                    hard_embed=args.hard_embed,
-                    beta=args.beta,
-                    lam=args.lam,
-                    epoch_start=epoch_start,
-                    optimizer=optimizer,
-                    controller_state=controller_state
-                    )
-    else:
-        sys_train(model,
-                    train_loader=data['loader_train'],
-                    test_loader=data['loader_test'],
-                    source_graph=data['dataset_whole'],
-                    mode=args.mode,
-                    rec_kernel=args.rec_kernel,
-                    edge_sample_rate=args.edge_sample_rate,
-                    sil_momentum=args.sil_momentum,
-                    model_name=args.name,
-                    epochs=args.epochs,
-                    max_batches=args.max_batches,
-                    stop_epochs=args.stop_epochs,
-                    estimator=args.estimator,
-                    volume=args.volume,
-                    n_neighbors=args.n_neighbors,
-                    hard_embed=args.hard_embed,
-                    beta=args.beta,
-                    lam=args.lam,
-                    epoch_start=epoch_start,
-                    optimizer=optimizer,
-                    controller_state=controller_state,
-                    )
+    motif_train(model,
+                train_loader=data['loader_train'],
+                test_loader=data['loader_test'],
+                model_name=args.name,
+                epochs=args.epochs,
+                max_batches=args.max_batches,
+                stop_epochs=args.stop_epochs,
+                estimator=args.estimator,
+                volume=args.volume,
+                n_neighbors=args.n_neighbors,
+                hard_embed=args.hard_embed,
+                beta=args.beta,
+                lam=args.lam,
+                epoch_start=epoch_start,
+                optimizer=optimizer,
+                controller_state=controller_state,
+                edge_sample_rate=args.edge_sample_rate,
+                wl_iter=args.wl_iter,
+                )
