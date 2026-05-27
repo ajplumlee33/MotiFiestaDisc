@@ -9,6 +9,7 @@ import warnings
 warnings.simplefilter("ignore", UserWarning)
 
 from MotiFiesta.training.model import MotiFiestaModel
+from MotiFiesta.training.disc_model import DiscModel
 from MotiFiesta.training.loading import get_loader
 from MotiFiesta.training.train import motif_train
 from MotiFiesta.utils.learning_utils import dump_model_hparams
@@ -57,13 +58,18 @@ if function == 'train':
     parser.add_argument("--sil-momentum", type=float, default=0.95,
                         help="EMA momentum for the sampling invariance tracker (higher = more stable targets)")
 
+    parser.add_argument("--model-type", type=str, default='motifiesta',
+                        choices=['motifiesta', 'disc'],
+                        help="Model architecture: motifiesta (original) or disc (GIN + EdgePool).")
     parser.add_argument("--steps", "-s", type=int, default=5)
     parser.add_argument("--dim", "-d", type=int, default=8)
     parser.add_argument("--pool-dummy", action="store_true", default=False)
     parser.add_argument("--score-method", default="sigmoid", help="Edge scoring method: (sigmoid, softmax-neighbors, softmax-all)")
     parser.add_argument("--merge-method", default="sum", help="Edge merge method: (sum, cat, set2set)")
     parser.add_argument("--hard-embed", action='store_true', help="Whether to use hard embedding using degree histogram.")
-    parser.add_argument("--parallel-matching", action='store_true', default=False, help="Use Luby parallel matching in EdgePooling layers.")
+    parser.add_argument("--matching-mode", default="greedy", choices=["greedy", "luby"], help="Edge matching algorithm: greedy (sequential) or luby (parallel).")
+    parser.add_argument("--scoring-mode", default="mlp", choices=["mlp", "attention"], help="Edge scoring method: mlp or multi-head attention.")
+    parser.add_argument("--n-heads", type=int, default=4, help="Number of attention heads (only used when --scoring-mode=attention).")
     parser.add_argument("--device", type=str, default=None, help="Force compute device: cpu, cuda, mps.")
 
     # --- Synthetic single-graph dataset flags (used only when data_root --
@@ -105,13 +111,16 @@ if function == 'train':
     make_dirs(args.name)
 
     hparams = {'model':{
+                        'model_type': args.model_type,
                         'dim': args.dim,
                         'steps': args.steps,
                         'pool_dummy': args.pool_dummy,
                         'edge_score_method': args.score_method,
                         'merge_method': args.merge_method,
                         'hard_embed': args.hard_embed,
-                        'parallel_matching': args.parallel_matching,
+                        'matching_mode': args.matching_mode,
+                        'scoring_mode': args.scoring_mode,
+                        'n_heads': args.n_heads,
                          },
                'train': {
                         'epochs': args.epochs,
@@ -149,8 +158,8 @@ if function == 'train':
 
     print(">>> loading data")
     data = get_loader(
+                      root=args.dataset,
                       name=args.dataset,
-                      root=args.data_root,
                       batch_size=hparams['train']['batch_size'],
                       attributed=hparams['train']['attributed'],
                       **loader_extra,
@@ -175,7 +184,10 @@ if function == 'train':
         model = model_dict['model']
         epoch_start, optimizer, controller_state = 0, None, None
     else:
-        model = MotiFiestaModel(**hparams['model'])
+        if args.model_type == 'disc':
+            model = DiscModel(**hparams['model'])
+        else:
+            model = MotiFiestaModel(**hparams['model'])
         epoch_start, optimizer, controller_state = 0, None, None
     print(model)
 
