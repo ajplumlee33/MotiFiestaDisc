@@ -37,7 +37,7 @@ MOTIF_SIZE    = 10
 SOURCE_SIZE   = 500    # nodes in each source graph; p=0.1 is feasible at this scale
 SOURCE_EPROB  = 0.05   # louvain: lower p keeps bg communities sparser than K10 cliques
 N_MOTIFS      = 25     # motifs per source graph: 25×10 = 250 motif nodes = 50% coverage
-DISTORT_P     = 0.0
+DISTORT_P     = 0.05
 N_GRAPHS      = 40     # source graphs to generate
 SEED_BASE     = 42
 
@@ -70,8 +70,9 @@ def make_neg_er(pos, source_eprob, seed):
     return data
 
 
-def make_source_graph(motif_size, source_size, source_eprob, n_motifs, seed):
+def make_source_graph(motif_size, source_size, source_eprob, n_motifs, seed, distort_p=0.0):
     """ER background graph with n_motifs K-clique instances planted."""
+    import itertools
     rng = random.Random(seed)
     G = nx.erdos_renyi_graph(source_size, source_eprob, seed=seed)
     nx.set_node_attributes(G, 0, 'is_motif')
@@ -86,6 +87,13 @@ def make_source_graph(motif_size, source_size, source_eprob, n_motifs, seed):
             for j in motif_nodes:
                 if i < j:
                     G.add_edge(i, j)
+        if distort_p > 0:
+            for u, v in itertools.combinations(motif_nodes, 2):
+                if rng.random() < distort_p:
+                    if G.has_edge(u, v):
+                        G.remove_edge(u, v)
+                    else:
+                        G.add_edge(u, v)
         # random cross edges between motif instance and background
         for m in motif_nodes:
             for b in range(source_size):
@@ -121,6 +129,7 @@ def main():
         data = make_source_graph(
             MOTIF_SIZE, SOURCE_SIZE, SOURCE_EPROB, N_MOTIFS,
             seed=SEED_BASE + i,
+            distort_p=DISTORT_P,
         )
         subs = decompose(data, seed=SEED_BASE + i)
         all_subgraphs.extend(subs)

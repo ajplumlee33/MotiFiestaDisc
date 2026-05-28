@@ -161,14 +161,14 @@ class MotiFiestaModel(torch.nn.Module):
 
         return xx, pp, ee, batches, merge_info, internals
 
-    def rec_loss(self,
-                 xx,
-                 ee,
-                 merge_info,
-                 source_graph,
-                 internals,
-                 num_nodes=20,
-                 draw=False):
+    def rec_loss_wwl(self,
+                    xx,
+                    ee,
+                    merge_info,
+                    source_graph,
+                    internals,
+                    num_nodes=20,
+                    draw=False):
         """reconstruction loss at all coarsening levels using the wwl kernel."""
         source_ig = source_graph.ig_graph
         source_x = source_graph.cached_data.x
@@ -211,17 +211,17 @@ class MotiFiestaModel(torch.nn.Module):
 
         return loss / self.steps
     
-    def rec_loss_wl(self,
-                    xx,
-                    ee,
-                    merge_info,
-                    source_graph,
-                    internals,
-                    num_nodes=20,
-                    edge_sample_rate=1.0,
-                    wl_iter=3,
-                    max_spotlight_nodes=20,
-                    ):
+    def rec_loss(self,
+                 xx,
+                 ee,
+                 merge_info,
+                 source_graph,
+                 internals,
+                 num_nodes=20,
+                 edge_sample_rate=1.0,
+                 wl_iter=3,
+                 max_spotlight_nodes=20,
+                 ):
         """edge-level reconstruction loss using the wl subtree kernel.
 
         for each pooling level, iterates over edges in ee[level] and builds the

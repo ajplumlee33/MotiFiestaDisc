@@ -60,7 +60,9 @@ if function == 'train':
 
     parser.add_argument("--model-type", type=str, default='motifiesta',
                         choices=['motifiesta', 'disc'],
-                        help="Model architecture: motifiesta (original) or disc (GIN + EdgePool).")
+                        help="Model architecture: motifiesta (original) or disc (scatter-pool).")
+    parser.add_argument("--gin-layers", type=int, default=2,
+                        help="Number of global GIN layers for disc model.")
     parser.add_argument("--steps", "-s", type=int, default=5)
     parser.add_argument("--dim", "-d", type=int, default=8)
     parser.add_argument("--pool-dummy", action="store_true", default=False)
@@ -121,6 +123,7 @@ if function == 'train':
                         'matching_mode': args.matching_mode,
                         'scoring_mode': args.scoring_mode,
                         'n_heads': args.n_heads,
+                        'gin_layers': args.gin_layers,
                          },
                'train': {
                         'epochs': args.epochs,

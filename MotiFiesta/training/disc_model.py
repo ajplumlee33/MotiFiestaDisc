@@ -1,12 +1,10 @@
-from collections import defaultdict
-
-import numpy as np
 import torch
 import torch.nn.functional as F
 from torch_geometric.nn import GINConv
+from torch_scatter import scatter_mean
 
-from MotiFiesta.training.edge_pool import EdgePooling
 from MotiFiesta.utils.learning_utils import get_device
+from MotiFiesta.training.scatter_pool import ScatterPool
 
 
 def _gin_mlp(in_dim, out_dim):
@@ -26,16 +24,12 @@ def matrix_cosine(a, b, eps=1e-8):
 
 
 class DiscModel(torch.nn.Module):
-    """EdgePool motif discovery with GIN convolution before each pooling level.
+    """scatter-pool motif discovery model.
 
-    GIN enriches each node's embedding with neighborhood context before each
-    pooling decision, giving score_net a level-appropriate structural signal at
-    every coarsening depth. GIN's WL-equivalent expressiveness also strengthens
-    rec_loss_wl — the architecture is predisposed toward the WL similarity
-    targets rather than fighting them through a linear bottleneck.
-
-    interface is identical to MotiFiestaModel: forward() returns the same tuple,
-    and freq_loss / rec_loss_wl have the same signatures.
+    global GIN pass produces H once. ScatterPool levels segment the graph
+    using Z = scatter_mean(H, assignment) for scoring.
+    motif embedding at level t is Z[i] (mean of H
+    over spotlight), consistent across instances by WL-equivalence.
     """
 
     def __init__(
@@ -43,210 +37,149 @@ class DiscModel(torch.nn.Module):
         n_features=61,
         dim=8,
         steps=5,
-        hard_embed=False,
+        gin_layers=2,
         matching_mode='luby',
-        scoring_mode='mlp',
-        n_heads=4,
-        **kwargs,  # absorb motifiesta-only hparams (pool_dummy, edge_score_method, etc.)
+        hard_embed=False,
+        # absorb motifiesta-only hparams
+        scoring_mode=None,
+        n_heads=None,
+        pool_dummy=None,
+        edge_score_method=None,
+        merge_method=None,
+        **kwargs,
     ):
         super().__init__()
         self.n_features = n_features
         self.hidden_dim = dim
         self.steps = steps
-        self.hard_embed = hard_embed
+        self.gin_layers_count = gin_layers
         self.matching_mode = matching_mode
-        self.scoring_mode = scoring_mode
-        self.n_heads = n_heads
 
-        # level 0: project in_features → dim; levels 1-steps: dim → dim
-        self.gin_layers = torch.nn.ModuleList([
+        self.global_gin = torch.nn.ModuleList([
             GINConv(_gin_mlp(n_features, dim)),
-            *[GINConv(_gin_mlp(dim, dim)) for _ in range(steps)],
+            *[GINConv(_gin_mlp(dim, dim)) for _ in range(gin_layers - 1)],
         ])
 
-        # level 0 pool receives n_features (pre-gin); levels 1+ receive dim (x_new from previous level)
+        # frozen random GIN: same architecture, fixed weights, used as structural
+        # similarity target in rec_loss — replaces the WL kernel, fully GPU-native
+        self.frozen_gin = torch.nn.ModuleList([
+            GINConv(_gin_mlp(n_features, dim)),
+            *[GINConv(_gin_mlp(dim, dim)) for _ in range(gin_layers - 1)],
+        ])
+        for p in self.frozen_gin.parameters():
+            p.requires_grad_(False)
+
         self.pool_layers = torch.nn.ModuleList([
-            EdgePooling(
-                n_features, dim,
-                matching_mode=matching_mode,
-                scoring_mode=scoring_mode,
-                n_heads=n_heads,
-            ),
-            *[
-                EdgePooling(
-                    dim, dim,
-                    matching_mode=matching_mode,
-                    scoring_mode=scoring_mode,
-                    n_heads=n_heads,
-                )
-                for _ in range(steps)
-            ],
+            ScatterPool(dim, matching_mode=matching_mode)
+            for _ in range(steps + 1)
         ])
 
-        # alias so load_model backward-compat and decoder work unchanged
+        # alias for load_model backward compat
         self.layers = self.pool_layers
 
     def forward(self, x, edge_index, batch, n_id=None, dummy=False, **kwargs):
+        n_nodes = x.size(0)
         if n_id is None:
-            n_id = torch.arange(len(x), device=x.device)
+            n_id = torch.arange(n_nodes, device=x.device)
 
-        n_batch_nodes = x.size(0)
-        spotlight_assignment = [
-            torch.arange(n_batch_nodes, device=x.device, dtype=torch.long)
-        ]
+        # global GIN pass — H fixed for all levels
+        h = x
+        for gin in self.global_gin:
+            h = F.relu(gin(h, edge_index))
+
+        cum_assign = torch.arange(n_nodes, device=x.device, dtype=torch.long)
+        edge_index_cur = edge_index
+        batch_cur = batch
+
+        cumulative_assignments = [cum_assign.clone()]  # level 0 = identity
         cluster_chain = []
 
-        xx, ee, pp, batches, internals = [], [], [], [], []
+        xx, pp, ee, batches, internals = [], [], [], [], []
+        supernode_score_levels = []
 
-        for t, (gin, pool) in enumerate(zip(self.gin_layers, self.pool_layers)):
-            if len(edge_index[0]) < 1:
+        for pool in self.pool_layers:
+            n_cur = x.size(0) if len(xx) == 0 else xx[-1].size(0)
+            # recompute n_cur from cum_assign
+            n_cur = cum_assign.max().item() + 1
+
+            Z = scatter_mean(h, cum_assign, dim=0, dim_size=n_cur)
+
+            cluster, edge_scores, edge_logits, new_ei, new_batch = pool(Z, edge_index_cur, batch_cur)
+
+            if edge_scores.size(0) > 0:
+                sup_scores = scatter_mean(edge_scores, edge_index_cur[0], dim=0, dim_size=n_cur)
+            else:
+                sup_scores = torch.zeros(n_cur, device=x.device)
+
+            cum_assign = cluster[cum_assign]
+            cluster_chain.append(cluster)
+            cumulative_assignments.append(cum_assign)
+
+            xx.append(Z)
+            pp.append(edge_scores)
+            ee.append(edge_index_cur)
+            batches.append(batch_cur)
+            supernode_score_levels.append(sup_scores)
+            internals.append({
+                'x_merged': Z,
+                'edge_scores': edge_scores,
+                'edge_logits': edge_logits,
+                'supernode_scores': sup_scores,
+                'edge_index': edge_index_cur,
+            })
+
+            edge_index_cur = new_ei
+            batch_cur = new_batch
+
+            if new_ei.size(1) == 0:
                 break
 
-            # dual pathway: gin enriches for scoring only; x (pre-gin) feeds transform for hash embeddings.
-            # this keeps hash embeddings consistent across instances while giving score_net expressive features.
-            x_gin = F.relu(gin(x, edge_index))
-
-            out = pool(x, edge_index, batch, hard_embed=self.hard_embed, dummy=dummy, x_score=x_gin)
-
-            ee.append(edge_index)
-            xx.append(x)
-            pp.append(out['internals']['edge_scores'])
-            batches.append(batch)
-            internals.append(out['internals'])
-
-            cluster = out['new_graph']['unpool'].cluster
-            cluster_chain.append(cluster)
-            spotlight_assignment.append(cluster[spotlight_assignment[-1]])
-
-            edge_index = out['new_graph']['e_ind_new']
-            x = out['new_graph']['x_new']
-            batch = out['new_graph']['batch_new']
-
-        spotlights = []
-        for sa in spotlight_assignment:
-            spot_t = defaultdict(set)
-            for node_idx, sup_id in enumerate(sa.tolist()):
-                spot_t[sup_id].add(node_idx)
-            spotlights.append(spot_t)
-
-        tree = [defaultdict(set)]
-        for cluster in cluster_chain:
-            tree_t = defaultdict(set)
-            for child_id, parent_id in enumerate(cluster.tolist()):
-                tree_t[parent_id].add(child_id)
-            tree.append(tree_t)
-
         merge_info = {
-            'spotlight_assignment': spotlight_assignment,
-            'cluster_chain': cluster_chain,
+            'cumulative_assignments': cumulative_assignments[:-1],  # indices match xx
+            'supernode_scores': supernode_score_levels,
             'n_id': n_id,
-            'spotlights': spotlights,
-            'tree': tree,
+            # kept for backward compat with total_sigma / old decoder path
+            'spotlights': None,
+            'tree': None,
         }
 
         return xx, pp, ee, batches, merge_info, internals
 
-    def rec_loss_wl(
-        self,
-        xx,
-        ee,
-        merge_info,
-        source_graph,
-        internals,
-        num_nodes=20,
-        edge_sample_rate=1.0,
-        wl_iter=3,
-        max_spotlight_nodes=20,
-    ):
-        from MotiFiesta.training.wl_kernel import (
-            wl_subtree_similarity_batch,
-            initial_labels_from_onehot,
-        )
-        from torch_geometric.utils import subgraph as pyg_subgraph
+    def rec_loss(self, xx, ee, merge_info, batch, internals=None):
+        """structural similarity loss via frozen random GIN.
 
+        K_true  = cosine similarity of frozen GIN supernode embeddings
+        K_predict = cosine similarity of trainable GIN supernode embeddings
+        """
         device = get_device()
-        use_cpu_kernel = (device.type == 'mps')
+        x = batch.x.to(device)
+        edge_index = batch.edge_index.to(device)
 
-        source_edge_index = source_graph.cached_data.edge_index
-        source_x = source_graph.cached_data.x
-        if use_cpu_kernel:
-            source_edge_index = source_edge_index.cpu()
-            source_x = source_x.cpu()
-        else:
-            source_edge_index = source_edge_index.to(device)
-            source_x = source_x.to(device)
-        source_labels = initial_labels_from_onehot(source_x)
-        n_source = source_labels.size(0)
+        with torch.no_grad():
+            h_frozen = x
+            for gin in self.frozen_gin:
+                h_frozen = F.relu(gin(h_frozen, edge_index))
 
-        spot_assign = merge_info['spotlight_assignment']
-        n_id = merge_info['n_id']
+        cum_assigns = merge_info['cumulative_assignments']
 
         loss = 0
+        n_levels_used = 0
         for level in range(len(xx)):
-            x = internals[level]['x_merged']
-            n_take = min(num_nodes, x.size(0))
-            if n_take < 2:
+            Z = xx[level]
+            n_sup = Z.size(0)
+            if n_sup < 2:
                 continue
 
-            spot_t = spot_assign[level]
-            edge_idx = ee[level]
-            n_id_l = n_id
-            if use_cpu_kernel:
-                spot_t = spot_t.cpu()
-                edge_idx = edge_idx.cpu()
-                n_id_l = n_id.cpu()
+            cum_assign = cum_assigns[level]
+            Z_frozen = scatter_mean(h_frozen, cum_assign, dim=0, dim_size=n_sup)
 
-            edge_indices, node_counts, init_labels, valid_local = [], [], [], []
-
-            for k in range(n_take):
-                u_idx = edge_idx[0, k].item()
-                v_idx = edge_idx[1, k].item()
-
-                mask = (spot_t == u_idx) | (spot_t == v_idx)
-                local_members = mask.nonzero(as_tuple=False).squeeze(-1)
-                if local_members.numel() == 0:
-                    continue
-
-                global_node_idx = n_id_l[local_members].sort().values
-
-                if global_node_idx.size(0) > max_spotlight_nodes:
-                    perm = torch.randperm(global_node_idx.size(0))[:max_spotlight_nodes]
-                    global_node_idx = global_node_idx[perm].sort().values
-
-                ei_sub, _ = pyg_subgraph(
-                    global_node_idx,
-                    source_edge_index,
-                    relabel_nodes=True,
-                    num_nodes=n_source,
-                )
-                edge_indices.append(ei_sub)
-                node_counts.append(global_node_idx.size(0))
-                init_labels.append(source_labels[global_node_idx])
-                valid_local.append(k)
-
-            if len(valid_local) < 2:
-                continue
-
-            K_valid = wl_subtree_similarity_batch(
-                edge_indices, node_counts, init_labels, n_iter=wl_iter,
-            )
-
-            K_true = torch.zeros(n_take, n_take, device=device)
-            valid_idx = torch.tensor(valid_local, dtype=torch.long, device=device)
-            K_true[valid_idx.unsqueeze(1), valid_idx.unsqueeze(0)] = K_valid.to(device)
-
-            K_predict = matrix_cosine(x[:n_take], x[:n_take]).to(device)
-
-            if edge_sample_rate < 1.0:
-                mask = torch.rand(n_take, n_take, device=device) < edge_sample_rate
-                mask = mask | mask.t()
-                mask.fill_diagonal_(True)
-                K_predict = K_predict * mask.float()
-                K_true = K_true * mask.float()
+            K_true = matrix_cosine(Z_frozen, Z_frozen).detach()
+            K_predict = matrix_cosine(Z, Z)
 
             loss += torch.nn.MSELoss()(K_predict, K_true)
+            n_levels_used += 1
 
-        return loss / self.steps
+        return loss / max(n_levels_used, 1)
 
     @staticmethod
     def distance_density(X, X_ref, k=20, max_ref=2000):
@@ -258,56 +191,44 @@ class DiscModel(torch.nn.Module):
             knn_dists, _ = dists.topk(k, dim=1, largest=False)
             return knn_dists[:, k - 1]
 
-    def freq_loss(
-        self,
-        internals_pos,
-        internals_neg,
-        pp,
-        estimator='knn',
-        beta=1,
-        lam=1,
-        steps=3,
-        volume=False,
-        k=30,
-        wl_weights=None,
-    ):
+    def cosine_loss(self, internals_pos):
+        """contrastive z-cosine supervision for score_net.
+
+        targets are z-cosine between endpoint pairs, normalized within each
+        level to zero mean/unit std before being scaled to soft [0,1] labels.
+        normalization prevents the degenerate constant-prediction solution that
+        arises when all raw cosines are near 1.0 after scatter_mean pooling.
+        supervises pre-sigmoid logits with BCEWithLogitsLoss to avoid sigmoid
+        saturation blocking gradients.
+        """
         device = next(self.parameters()).device
-        tot_loss = None
-        for t in range(min(len(pp), len(internals_neg))):
-            x_pos = F.normalize(internals_pos[t]['x_merged'], dim=-1)
-            x_neg = F.normalize(internals_neg[t]['x_merged'], dim=-1)
-            s = pp[t]
-            w = wl_weights[t].to(device) if (wl_weights is not None and t < len(wl_weights)) else None
+        loss = 0
+        n_levels = 0
 
-            max_e = 500
-            if x_pos.size(0) > max_e:
-                perm = torch.randperm(x_pos.size(0), device=x_pos.device)[:max_e]
-                x_pos = x_pos[perm]
-                s = s[perm]
-                if w is not None:
-                    w = w[perm]
-            if x_neg.size(0) > max_e:
-                perm = torch.randperm(x_neg.size(0), device=x_neg.device)[:max_e]
-                x_neg = x_neg[perm]
+        for t in range(len(internals_pos)):
+            Z = internals_pos[t]['x_merged']
+            edge_idx = internals_pos[t]['edge_index']
+            edge_logits = internals_pos[t].get('edge_logits')
 
-            k_eff = min(k, x_pos.size(0), x_neg.size(0))
-            if k_eff < 2:
+            if edge_idx.size(1) == 0 or edge_logits is None or edge_logits.size(0) == 0:
                 continue
 
-            density_pos = self.distance_density(x_pos, x_pos, k=k_eff)
-            density_neg = self.distance_density(x_pos, x_neg, k=k_eff)
+            z_src = F.normalize(Z[edge_idx[0]], dim=-1)
+            z_dst = F.normalize(Z[edge_idx[1]], dim=-1)
+            cos_target = (z_src * z_dst).sum(dim=-1).detach()
 
-            f_pos = density_pos.view(-1, 1).squeeze()
-            f_neg = density_neg.view(-1, 1).squeeze()
+            # skip levels with no contrast — scatter_mean collapses variance at higher levels
+            if cos_target.numel() < 2 or cos_target.std() < 1e-5:
+                continue
 
-            if w is not None:
-                l = (-1 * w * s * torch.exp(-1 * beta * (f_pos - f_neg))).mean()
-            else:
-                l = (-1 * s * torch.exp(-1 * beta * (f_pos - f_neg))).mean()
+            # normalize to zero mean/unit std then stretch to soft [0,1] labels
+            # temperature=2: one-std difference → sigmoid output ~0.88 vs ~0.12
+            target_norm = (cos_target - cos_target.mean()) / (cos_target.std() + 1e-6)
+            target_soft = torch.sigmoid(target_norm * 2).detach()
 
-            l += lam * s.pow(2.0).mean()
-            tot_loss = l if tot_loss is None else tot_loss + l
+            loss += F.binary_cross_entropy_with_logits(edge_logits, target_soft)
+            n_levels += 1
 
-        if tot_loss is None:
+        if n_levels == 0:
             return torch.zeros(1, device=device, requires_grad=True).squeeze()
-        return tot_loss / steps
+        return loss / n_levels
