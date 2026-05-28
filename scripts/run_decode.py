@@ -12,7 +12,7 @@ from MotiFiesta.training.decode import HashDecoder
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--run',       default='louvain_clique_k10_scatter')
+    parser.add_argument('--name',      default='louvain_clique_k10_scatter')
     parser.add_argument('--data',      default='data/louvain_decomp-clique-p0.05-n500-k10-d0.00')
     parser.add_argument('--level',     type=int,   default=1)
     parser.add_argument('--hash-dim',  type=int,   default=8)
@@ -20,7 +20,7 @@ def main():
     parser.add_argument('--n-runs',    type=int,   default=5)
     args = parser.parse_args()
 
-    MODEL_ID     = args.run
+    MODEL_ID     = args.name
     DATASET_ROOT = args.data
     LEVEL        = args.level
     HASH_DIM     = args.hash_dim

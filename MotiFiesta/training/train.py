@@ -270,11 +270,10 @@ def motif_train(model,
 
             if controller.keep_going('rec'):
                 with torch.no_grad():
-                    source_pos = _make_batch_source(batch_pos)
                     rec_loss = model.rec_loss(xx_pos,
                                                  ee_pos,
                                                  merge_info_pos,
-                                                 source_pos,
+                                                 batch_pos,
                                                  internals_pos,
                                                  )
             else:
