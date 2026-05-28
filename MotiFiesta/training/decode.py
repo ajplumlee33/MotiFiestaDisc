@@ -7,7 +7,9 @@ from torch_geometric.utils import to_networkx
 
 import torch
 import torch.nn.functional as F
+from torch_scatter import scatter_mean
 from lshashpy3 import LSHash
+
 
 from MotiFiesta.utils.learning_utils import load_model
 from MotiFiesta.training.loading import get_loader
@@ -92,7 +94,7 @@ class HashDecoder(Decoder):
             spotlight_ids = torch.zeros_like(batch, dtype=torch.long)
 
             with torch.no_grad():
-                embs,probas,ee,_,merge_info,_  = self.model(g.x,
+                embs,probas,ee,_,merge_info,internals  = self.model(g.x,
                                                           g.edge_index,
                                                           batch,
                                                           dummy=self.dummy)
@@ -104,17 +106,57 @@ class HashDecoder(Decoder):
                 all_spotlights.append(None)
                 continue
             g = to_networkx(g_pair['pos'])
-            for i,x in enumerate(embs[self.level]):
-                h = hash_table.index(x.detach().numpy())[0]
-                # def total_sigma(self, level, node, tree, sigmas, ee):
-                spotlight = list(merge_info['spotlights'][self.level][i])
-                score = self.total_sigma(self.level, i, merge_info['tree'], probas, ee)
-                hash_set.add(h)
-                for node in spotlight:
-                    motif_scores[node] = score
-                    g_hashes[node] = h
-                    spotlight_ids[node] = spot_count
-                spot_count += 1
+
+            use_scatter_path = (
+                merge_info.get('spotlights') is None
+                and merge_info.get('cumulative_assignments') is not None
+            )
+
+            if use_scatter_path:
+                cum_assign = merge_info['cumulative_assignments'][self.level]
+                Z = embs[self.level]
+
+                # sigma from internal edges only: for each supernode at self.level,
+                # find original-graph edges where both endpoints map to the same
+                # supernode. mean score of those internal edges = clean within-spotlight
+                # sigma, equivalent to original total_sigma without cross-edge pollution.
+                n_sup = Z.size(0)
+                ei_l0 = ee[0]
+                es_l0 = internals[0]['edge_scores']
+                src_sup = cum_assign[ei_l0[0]]
+                dst_sup = cum_assign[ei_l0[1]]
+                internal_mask = src_sup == dst_sup
+                if internal_mask.sum() > 0:
+                    # sum (not mean) mirrors original total_sigma: larger denser
+                    # structures accumulate more score naturally, no count weighting needed
+                    sup_scores = torch.zeros(n_sup, device=Z.device).scatter_add(
+                        0, src_sup[internal_mask], es_l0[internal_mask]
+                    )
+                else:
+                    node_scores_l0 = merge_info['supernode_scores'][0]
+                    sup_scores = scatter_mean(node_scores_l0, cum_assign, dim=0, dim_size=n_sup)
+
+                for i, x in enumerate(embs[self.level]):
+                    h = hash_table.index(x.detach().numpy())[0]
+                    spotlight = (cum_assign == i).nonzero(as_tuple=False).flatten().tolist()
+                    score = sup_scores[i].item()
+                    hash_set.add(h)
+                    for node in spotlight:
+                        motif_scores[node] = score
+                        g_hashes[node] = h
+                        spotlight_ids[node] = spot_count
+                    spot_count += 1
+            else:
+                for i, x in enumerate(embs[self.level]):
+                    h = hash_table.index(x.detach().numpy())[0]
+                    spotlight = list(merge_info['spotlights'][self.level][i])
+                    score = self.total_sigma(self.level, i, merge_info['tree'], probas, ee)
+                    hash_set.add(h)
+                    for node in spotlight:
+                        motif_scores[node] = score
+                        g_hashes[node] = h
+                        spotlight_ids[node] = spot_count
+                    spot_count += 1
             all_scores.append(motif_scores)
             all_hashes.append(g_hashes)
             all_spotlights.append(spotlight_ids)
@@ -158,34 +200,59 @@ class HashDecoder(Decoder):
 
         return motifs_pred_all, true_motif_ids, sigma_all
 
+    def edge_score_stats(self, n_graphs=10):
+        """print mean/std of score_net outputs per level to diagnose degenerate predictors."""
+        self.model.eval()
+        from collections import defaultdict
+        scores_by_level = defaultdict(list)
+
+        for idx, g_pair in enumerate(self.dataset['dataset_whole']):
+            if idx >= n_graphs:
+                break
+            g = g_pair['pos']
+            batch = torch.zeros(len(g.x), dtype=torch.long)
+            with torch.no_grad():
+                _, _, _, _, _, internals = self.model(g.x, g.edge_index, batch, dummy=self.dummy)
+            for t, d in enumerate(internals):
+                if 'edge_scores' in d and d['edge_scores'] is not None:
+                    scores_by_level[t].append(d['edge_scores'].detach())
+
+        print("\nedge score stats (sigmoid score / pre-sigmoid logit per pooling level):")
+        for level in sorted(scores_by_level):
+            s = torch.cat(scores_by_level[level])
+            print(f"  level {level}: mean={s.mean():.4f}  std={s.std():.4f}  "
+                  f"min={s.min():.4f}  max={s.max():.4f}  n={len(s)}")
+
     def motif_sigma(self, decoded_graphs):
         _, true_motif_ids, sigma_all = HashDecoder.collect_output(decoded_graphs)
         sig_mot = torch.tensor([0., 0.]).scatter_add(0, true_motif_ids, sigma_all)
         vals, counts = torch.unique(true_motif_ids, return_counts=True)
         return sig_mot / counts
 
-    def eval(self, decoded_graphs, n_motifs=1, top_k=1):
+    def eval(self, decoded_graphs, n_motifs=1, top_k=1, rank_by='count'):
         """ Keep top k motifs and match them to the true motif annotation usin
         permutations and jaccard.
 
-        >>> from torch_geometric.data import Data
-        >>> scores = torch.tensor([.5, .9, .9, 1])
-        >>> true = torch.tensor([0, 0, 0, 1])
-        >>> pred = torch.tensor([1, 1, 1, 3])
-        >>> g = Data(cum_scores=scores, motif_pred=pred, motif_id=true)
-        >>> eval([g])
-        1.0
+        rank_by: 'count' (default) ranks by cluster size — most frequent hash
+                 bucket is selected. 'sigma' ranks by average cum_score.
         """
 
         # collect all the graphs into one big tensor
         motifs_pred_all, true_motif_ids, sigma_all = HashDecoder.collect_output(decoded_graphs)
 
-        # compute average sigma by motif ID
-        motif_ids,counts = torch.unique(motifs_pred_all, return_counts=True)
-        sigma_avg = torch.zeros_like(motif_ids, dtype=torch.float32).scatter_add(0, motifs_pred_all, sigma_all) / counts
+        # rank motifs by count, sigma, or sigma weighted by count
+        motif_ids, counts = torch.unique(motifs_pred_all, return_counts=True)
+        if rank_by == 'count':
+            rank_scores = counts.float()
+        elif rank_by == 'sigma':
+            # sum sigma per bucket: larger denser structures accumulate more,
+            # mirrors original total_sigma without needing count stabilisation
+            rank_scores = torch.zeros_like(motif_ids, dtype=torch.float32).scatter_add(0, motifs_pred_all, sigma_all)
+        else:
+            rank_scores = torch.zeros_like(motif_ids, dtype=torch.float32).scatter_add(0, motifs_pred_all, sigma_all) / counts
 
         # rank motifs
-        motifs_sorted = torch.argsort(sigma_avg, descending=True)
+        motifs_sorted = torch.argsort(rank_scores, descending=True)
         ranks = torch.zeros_like(motifs_sorted)
         for ind, val in enumerate(motifs_sorted):
             ranks[val] = ind

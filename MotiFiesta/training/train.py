@@ -7,18 +7,10 @@ from torch.utils.tensorboard import SummaryWriter
 from MotiFiesta.utils.learning_utils import get_device
 
 
-def _make_batch_source(batch):
-    """wrap a pyg batch as a source object for rec_loss_wl."""
-    class _Src:
-        pass
-    src = _Src()
-    src.cached_data = batch
-    return src
-
 
 def compute_wl_cross_weights(batch_pos, batch_neg, ee_pos, merge_info_pos,
                               wl_iter=3, max_spotlight_nodes=20):
-    """per-edge WL cross-similarity weights for freq_loss.
+    """per-edge WL cross-similarity weights for cosine_loss.
 
     for each edge spotlight in pos at each pooling level, extracts the induced
     subgraph from neg at the same node indices and computes WL similarity.
@@ -223,15 +215,12 @@ def motif_train(model,
             warmup_done = False
 
             if controller.keep_going('rec') and not hard_embed:
-                source_pos = _make_batch_source(batch_pos)
                 _t = time.time()
-                rec_loss = model.rec_loss_wl(xx_pos,
+                rec_loss = model.rec_loss(xx_pos,
                                              ee_pos,
                                              merge_info_pos,
-                                             source_pos,
+                                             batch_pos,
                                              internals_pos,
-                                             edge_sample_rate=edge_sample_rate,
-                                             wl_iter=wl_iter,
                                              )
                 t_rec += time.time() - _t
                 rec_loss_tot += rec_loss.item()
@@ -241,22 +230,7 @@ def motif_train(model,
                 warmup_done = True
 
             if controller.keep_going('mot') and warmup_done:
-                batch_neg = batch['neg'].to(get_device())
-                x_neg, edge_index_neg = batch_neg.x, batch_neg.edge_index
-                xx_neg, pp_neg, ee_neg, _, merge_info_neg, internals_neg = model(x_neg,
-                                                                                  edge_index_neg,
-                                                                                  batch_neg.batch
-                                                                                  )
-                mot_loss = model.freq_loss(internals_pos,
-                                           internals_neg,
-                                           pp_pos,
-                                           steps=model.steps,
-                                           estimator=estimator,
-                                           volume=volume,
-                                           k=n_neighbors,
-                                           lam=lam,
-                                           beta=beta,
-                                           )
+                mot_loss = model.cosine_loss(internals_pos)
                 loss += mot_loss
                 mot_loss_tot += mot_loss.item()
                 backward = True
@@ -297,13 +271,11 @@ def motif_train(model,
             if controller.keep_going('rec'):
                 with torch.no_grad():
                     source_pos = _make_batch_source(batch_pos)
-                    rec_loss = model.rec_loss_wl(xx_pos,
+                    rec_loss = model.rec_loss(xx_pos,
                                                  ee_pos,
                                                  merge_info_pos,
                                                  source_pos,
                                                  internals_pos,
-                                                 edge_sample_rate=edge_sample_rate,
-                                                 wl_iter=wl_iter,
                                                  )
             else:
                 warmup_done = True
@@ -311,23 +283,8 @@ def motif_train(model,
             mot_loss = torch.tensor(float('nan'))
 
             if warmup_done:
-                batch_neg = batch['neg'].to(get_device())
-                x_neg, edge_index_neg = batch_neg.x, batch_neg.edge_index
                 with torch.no_grad():
-                    xx_neg, pp_neg, ee_neg, _, merge_info_neg, internals_neg = model(x_neg,
-                                                                                      edge_index_neg,
-                                                                                      batch_neg.batch
-                                                                                      )
-                mot_loss = model.freq_loss(internals_pos,
-                                           internals_neg,
-                                           pp_pos,
-                                           steps=model.steps,
-                                           estimator=estimator,
-                                           volume=volume,
-                                           k=n_neighbors,
-                                           lam=lam,
-                                           beta=beta,
-                                           )
+                    mot_loss = model.cosine_loss(internals_pos)
 
 
             if not warmup_done:

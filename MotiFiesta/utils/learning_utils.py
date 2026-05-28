@@ -92,6 +92,18 @@ def load_model(run, permissive=False, verbose=True):
                     print(f"shape mismatch for {k}: ckpt {state_dict[k].shape} vs model {fresh[k].shape} — using fresh init")
                 state_dict[k] = fresh[k]
 
+        # drop checkpoint keys that don't exist in current model (arch removals)
+        for k in list(state_dict.keys()):
+            if k not in fresh:
+                if verbose:
+                    print(f"dropping unknown key {k}")
+                del state_dict[k]
+
+        # fill any keys present in model but missing from checkpoint with fresh weights
+        for k, v in fresh.items():
+            if k not in state_dict:
+                state_dict[k] = v
+
         model.load_state_dict(state_dict)
 
         optimizer = torch.optim.Adam(model.parameters())
