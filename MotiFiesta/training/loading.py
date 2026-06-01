@@ -34,18 +34,22 @@ def get_loader(root,
         Dictionary with loaders and datasets for train/test
 
     """
-    if 'bfs_decomp' in root or 'louvain_decomp' in root:
+    if name in ('louvain_decomp', 'synth_pairs') or 'louvain_decomp' in root:
         cache = os.path.join(root, 'processed', 'data_0.pt')
         if not os.path.exists(cache):
             raise FileNotFoundError(
-                f"no decomposed cache at {cache} — run scripts/build_data_bfs.py first"
+                f"no cache at {cache} — run scripts/build_synth_data.py or build_data_bfs.py first"
             )
-        if 'louvain_decomp' in root:
-            print(">>> SUCCESS: Louvain-decomposed dataset detected")
-            dataset = LouvainDecomposedDataset(root=root)
-        else:
-            print(">>> SUCCESS: BFS-decomposed dataset detected")
-            dataset = BFSDecomposedDataset(root=root)
+        print(">>> SUCCESS: pre-built graph-pair dataset detected")
+        dataset = LouvainDecomposedDataset(root=root)
+    elif name == 'bfs_decomp' or 'bfs_decomp' in root:
+        cache = os.path.join(root, 'processed', 'data_0.pt')
+        if not os.path.exists(cache):
+            raise FileNotFoundError(
+                f"no cache at {cache} — run scripts/build_data_bfs.py first"
+            )
+        print(">>> SUCCESS: BFS-decomposed dataset detected")
+        dataset = BFSDecomposedDataset(root=root)
     elif 'mips_torch' in root:
         print(">>> SUCCESS: Systems dataset detected")
         dataset = SysTxtDataset(root=root)
@@ -92,8 +96,7 @@ def get_loader(root,
         )
         test_idx = indices[split_idx:]
 
-        # num_neighbors matches motif_size so each batch centered on a motif
-        # seed captures exactly one complete motif instance at hop-1.
+        # 1-hop neighborhood: captures one complete motif instance from a motif seed
         motif_size = int(kwargs.get('motif_size', 10))
         num_neighbors = [motif_size - 1, 0]
 

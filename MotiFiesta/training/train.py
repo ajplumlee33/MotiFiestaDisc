@@ -151,6 +151,8 @@ def motif_train(model,
                 controller_state=None,
                 edge_sample_rate=1.0,
                 wl_iter=3,
+                freeze_encoder=False,
+                structural_loss_coef=1.0,
                 ):
     """motif_train.
 
@@ -174,16 +176,23 @@ def motif_train(model,
         controller = Controller()
         controller.set_state(controller_state)
 
+    if freeze_encoder and hasattr(model, 'edge_scorer'):
+        # freeze GIN, input_proj, transforms — only edge_scorer trains
+        for name, p in model.named_parameters():
+            if 'edge_scorer' not in name:
+                p.requires_grad_(False)
+        trainable = [p for p in model.parameters() if p.requires_grad]
+        print(f"freeze_encoder: training {sum(p.numel() for p in trainable)} params (edge_scorer only)")
+
     if optimizer is None:
-        optimizer = torch.optim.Adam(model.parameters())
+        trainable = [p for p in model.parameters() if p.requires_grad]
+        optimizer = torch.optim.Adam(trainable)
 
     mot_loss, rec_loss = [torch.tensor(float('nan'))] * 2
-    done_training = False
+    best_combined_loss = float('inf')
 
     for epoch in range(epoch_start, epochs):
-        if done_training:
-            print("DONE TRAINING")
-            break
+        in_warmup = epoch < stop_epochs
 
         model.train()
         model.to(get_device())
@@ -212,25 +221,26 @@ def motif_train(model,
 
             loss = 0
             backward = False
-            warmup_done = False
 
-            if controller.keep_going('rec') and not hard_embed:
+            if in_warmup and not hard_embed and hasattr(model, 'rec_loss'):
                 _t = time.time()
-                rec_loss = model.rec_loss(xx_pos,
-                                             ee_pos,
-                                             merge_info_pos,
-                                             batch_pos,
-                                             internals_pos,
-                                             )
+                rec_loss = model.rec_loss(xx_pos, internals_pos, batch_pos)
                 t_rec += time.time() - _t
                 rec_loss_tot += rec_loss.item()
                 backward = True
                 loss += rec_loss
-            else:
-                warmup_done = True
 
-            if controller.keep_going('mot') and warmup_done:
-                mot_loss = model.cosine_loss(internals_pos)
+            if not in_warmup:
+                if hasattr(model, 'freq_loss'):
+                    batch_neg = batch['neg'].to(get_device())
+                    with torch.no_grad():
+                        _, _, _, _, _, internals_neg = model(
+                            batch_neg.x, batch_neg.edge_index, batch_neg.batch
+                        )
+                    mot_loss = model.freq_loss(internals_pos, internals_neg, pp_pos,
+                                               beta=beta, lam=lam, k=n_neighbors)
+                else:
+                    mot_loss = model.cosine_loss(internals_pos)
                 loss += mot_loss
                 mot_loss_tot += mot_loss.item()
                 backward = True
@@ -240,8 +250,6 @@ def motif_train(model,
                 loss.backward()
                 optimizer.step()
                 t_bwd += time.time() - _t
-            else:
-                done_training = True
 
         N = max_batches if max_batches > 0 else len(train_loader)
 
@@ -266,29 +274,26 @@ def motif_train(model,
                                                                                   edge_index_pos,
                                                                                   batch_pos.batch
                                                                                   )
-            warmup_done = False
-
-            if controller.keep_going('rec'):
-                with torch.no_grad():
-                    rec_loss = model.rec_loss(xx_pos,
-                                                 ee_pos,
-                                                 merge_info_pos,
-                                                 batch_pos,
-                                                 internals_pos,
-                                                 )
-            else:
-                warmup_done = True
-
             mot_loss = torch.tensor(float('nan'))
 
-            if warmup_done:
+            if in_warmup and hasattr(model, 'rec_loss'):
                 with torch.no_grad():
-                    mot_loss = model.cosine_loss(internals_pos)
-
-
-            if not warmup_done:
+                    rec_loss = model.rec_loss(xx_pos, internals_pos, batch_pos)
                 rec_loss_tot += rec_loss.item()
-            mot_loss_tot += mot_loss.item()
+
+            if not in_warmup:
+                if hasattr(model, 'freq_loss'):
+                    batch_neg = batch['neg'].to(get_device())
+                    with torch.no_grad():
+                        _, _, _, _, _, internals_neg = model(
+                            batch_neg.x, batch_neg.edge_index, batch_neg.batch
+                        )
+                        mot_loss = model.freq_loss(internals_pos, internals_neg, pp_pos,
+                                                   beta=beta, lam=lam, k=n_neighbors)
+                else:
+                    with torch.no_grad():
+                        mot_loss = model.cosine_loss(internals_pos)
+                mot_loss_tot += mot_loss.item()
 
         N = max_batches if max_batches > 0  else len(test_loader)
 
@@ -298,12 +303,18 @@ def motif_train(model,
 
         controller.update(test_losses)
 
-        torch.save({
+        checkpoint = {
             'epoch': epoch,
             'model_state_dict': {k: v.cpu() for k, v in model.state_dict().items()},
             'optimizer_state_dict': optimizer.state_dict(),
             'controller_state_dict': controller.state_dict()
-        }, f'models/{model_name}/{model_name}.pth')
+        }
+        torch.save(checkpoint, f'models/{model_name}/{model_name}.pth')
+
+        combined = sum(v for v in test_losses.values() if not math.isnan(v))
+        if combined < best_combined_loss:
+            best_combined_loss = combined
+            torch.save(checkpoint, f'models/{model_name}/{model_name}_best.pth')
 
         loss_str = ' '.join([f'{k} train: {v:2f}' for k,v in losses.items()])
         test_loss_str = ' '.join([f'{k} test: {v:2f}' for k,v in test_losses.items()])

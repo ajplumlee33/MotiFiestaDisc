@@ -17,9 +17,9 @@ import os
 import torch
 from MotiFiesta.utils.synthetic import generate_instances
 
-MOTIF_TYPE   = 'star'      # 'clique', 'star', 'barbell', 'wheel', 'lollipop', 'random'
-MOTIF_SIZE   = 20
-PARENT_SIZE  = 40          # background nodes; total graph ≈ motif_size + parent_size
+MOTIF_TYPE   = 'clique'    # 'clique', 'star', 'barbell', 'wheel', 'lollipop', 'random'
+MOTIF_SIZE   = 10
+PARENT_SIZE  = 20          # background nodes; total graph ≈ motif_size + parent_size (~2x motif size, paper appendix A.1)
 PARENT_EPROB = 0.1         # paper appendix A.1
 MAX_DEGREE   = 61
 DISTORT_P    = -1          # no distortion
@@ -28,7 +28,7 @@ USE_EIGEN_PE = False       # append laplacian eigenvectors to node features
 N_EIGEN      = 8           # number of eigenvectors (ignored if USE_EIGEN_PE=False)
 
 _eig_suffix = f'-eig{N_EIGEN}' if USE_EIGEN_PE else ''
-DEST_ROOT = f'data/louvain_decomp-synth-{MOTIF_TYPE}-k{MOTIF_SIZE}{_eig_suffix}'
+DEST_ROOT = f'data/synth-{MOTIF_TYPE}-k{MOTIF_SIZE}{_eig_suffix}'
 
 
 def laplacian_pe(data, k):

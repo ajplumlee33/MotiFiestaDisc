@@ -9,7 +9,7 @@ import warnings
 warnings.simplefilter("ignore", UserWarning)
 
 from MotiFiesta.training.model import MotiFiestaModel
-from MotiFiesta.training.disc_model import DiscModel
+from MotiFiesta.training.disc_model import MotiFiestaDisc
 from MotiFiesta.training.loading import get_loader
 from MotiFiesta.training.train import motif_train
 from MotiFiesta.utils.learning_utils import dump_model_hparams
@@ -59,10 +59,12 @@ if function == 'train':
                         help="EMA momentum for the sampling invariance tracker (higher = more stable targets)")
 
     parser.add_argument("--model-type", type=str, default='motifiesta',
-                        choices=['motifiesta', 'disc'],
+                        choices=['motifiesta', 'disc', 'subgraph'],
                         help="Model architecture: motifiesta (original) or disc (scatter-pool).")
     parser.add_argument("--gin-layers", type=int, default=2,
                         help="Number of global GIN layers for disc model.")
+    parser.add_argument("--wl-hops", type=int, default=1,
+                        help="Neighbor degree histogram hops prepended to node features (0=disable).")
     parser.add_argument("--steps", "-s", type=int, default=5)
     parser.add_argument("--dim", "-d", type=int, default=8)
     parser.add_argument("--pool-dummy", action="store_true", default=False)
@@ -73,6 +75,10 @@ if function == 'train':
     parser.add_argument("--scoring-mode", default="mlp", choices=["mlp", "attention"], help="Edge scoring method: mlp or multi-head attention.")
     parser.add_argument("--n-heads", type=int, default=4, help="Number of attention heads (only used when --scoring-mode=attention).")
     parser.add_argument("--device", type=str, default=None, help="Force compute device: cpu, cuda, mps.")
+    parser.add_argument("--freeze-encoder", action="store_true", default=False,
+                        help="Freeze GIN/transforms, train edge_scorer only (stage-2 score training).")
+    parser.add_argument("--structural-loss-coef", type=float, default=1.0,
+                        help="Weight on structural_loss term (0=disable, 1=full). Use <1 to limit embedding over-generalization.")
 
     # --- Synthetic single-graph dataset flags (used only when data_root --
     # contains 'sys_synth'; silently ignored otherwise) -----------------------
@@ -124,6 +130,7 @@ if function == 'train':
                         'scoring_mode': args.scoring_mode,
                         'n_heads': args.n_heads,
                         'gin_layers': args.gin_layers,
+                        'wl_hops': args.wl_hops,
                          },
                'train': {
                         'epochs': args.epochs,
@@ -161,7 +168,7 @@ if function == 'train':
 
     print(">>> loading data")
     data = get_loader(
-                      root=args.dataset,
+                      root=args.data_root if args.data_root != '.' else args.dataset,
                       name=args.dataset,
                       batch_size=hparams['train']['batch_size'],
                       attributed=hparams['train']['attributed'],
@@ -183,12 +190,19 @@ if function == 'train':
         controller_state = model_dict['controller_state_dict']
     elif args.init_from:
         print(f"Initializing weights from: {args.init_from}")
+        import json as _json
+        with open(f'models/{args.init_from}/hparams.json') as _f:
+            src_hparams = _json.load(_f)
+        # inherit source model arch so saved hparams match the actual weights
+        hparams['model'] = dict(src_hparams['model'])
+        hparams['model']['n_features'] = data['dataset_whole'].num_features
+        dump_model_hparams(args.name, hparams)
         model_dict = load_model(args.init_from)
         model = model_dict['model']
         epoch_start, optimizer, controller_state = 0, None, None
     else:
-        if args.model_type == 'disc':
-            model = DiscModel(**hparams['model'])
+        if args.model_type in ('disc', 'subgraph'):
+            model = MotiFiestaDisc(**hparams['model'])
         else:
             model = MotiFiestaModel(**hparams['model'])
         epoch_start, optimizer, controller_state = 0, None, None
@@ -213,4 +227,6 @@ if function == 'train':
                 controller_state=controller_state,
                 edge_sample_rate=args.edge_sample_rate,
                 wl_iter=args.wl_iter,
+                freeze_encoder=args.freeze_encoder,
+                structural_loss_coef=args.structural_loss_coef,
                 )

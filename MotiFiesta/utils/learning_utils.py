@@ -63,19 +63,20 @@ def load_model(run, permissive=False, verbose=True):
 
         # drop score_net keys if architecture changed (sequential vs linear, or size mismatch)
         # fresh init is fine since score_net weights are not transferable across architectures
-        cur_layer = model.layers[0]
-        ckpt_has_linear = 'layers.0.score_net.weight' in state_dict
-        ckpt_has_seq = 'layers.0.score_net.0.weight' in state_dict
-        cur_is_seq = isinstance(cur_layer.score_net, torch.nn.Sequential)
         fresh = model.state_dict()
         needs_fresh_score_net = False
-        if (ckpt_has_linear and cur_is_seq) or (ckpt_has_seq and not cur_is_seq):
-            needs_fresh_score_net = True
-        elif ckpt_has_linear:
-            ckpt_in = state_dict['layers.0.score_net.weight'].shape[1]
-            cur_in = cur_layer.score_net.weight.shape[1]
-            if ckpt_in != cur_in:
+        if hasattr(model, 'layers') and len(model.layers) > 0 and hasattr(model.layers[0], 'score_net'):
+            cur_layer = model.layers[0]
+            ckpt_has_linear = 'layers.0.score_net.weight' in state_dict
+            ckpt_has_seq = 'layers.0.score_net.0.weight' in state_dict
+            cur_is_seq = isinstance(cur_layer.score_net, torch.nn.Sequential)
+            if (ckpt_has_linear and cur_is_seq) or (ckpt_has_seq and not cur_is_seq):
                 needs_fresh_score_net = True
+            elif ckpt_has_linear:
+                ckpt_in = state_dict['layers.0.score_net.weight'].shape[1]
+                cur_in = cur_layer.score_net.weight.shape[1]
+                if ckpt_in != cur_in:
+                    needs_fresh_score_net = True
         if needs_fresh_score_net:
             for k in list(state_dict.keys()):
                 if 'score_net' in k:
@@ -133,9 +134,9 @@ def model_from_json(params):
     if 'parallel_matching' in model_params:
         val = model_params.pop('parallel_matching')
         model_params.setdefault('matching_mode', 'luby' if val else 'greedy')
-    if model_type == 'disc':
-        from MotiFiesta.training.disc_model import DiscModel
-        model = DiscModel(**model_params)
+    if model_type in ('subgraph', 'disc'):
+        from MotiFiesta.training.disc_model import MotiFiestaDisc
+        model = MotiFiestaDisc(**model_params)
     else:
         from MotiFiesta.training.model import MotiFiestaModel
         model = MotiFiestaModel(**model_params)

@@ -44,6 +44,7 @@ class MotiFiestaModel(torch.nn.Module):
                  matching_mode='greedy',
                  scoring_mode='mlp',
                  n_heads=4,
+                 **kwargs,
                  ):
         super(MotiFiestaModel, self).__init__()
 
