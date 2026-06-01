@@ -14,14 +14,35 @@ from lshashpy3 import LSHash
 from MotiFiesta.utils.learning_utils import load_model
 from MotiFiesta.training.loading import get_loader
 
+def _otsu_threshold(values):
+    import numpy as np
+    vals = values.cpu().detach().numpy()
+    n = len(vals)
+    if n == 0:
+        return 0.0
+    bins = np.linspace(vals.min(), vals.max(), 256)
+    best_thresh, best_var = float(bins[0]), -1.0
+    for t in bins:
+        fg = vals[vals >= t]
+        bg = vals[vals < t]
+        if len(fg) == 0 or len(bg) == 0:
+            continue
+        w_fg = len(fg) / n
+        w_bg = len(bg) / n
+        var = w_fg * w_bg * (fg.mean() - bg.mean()) ** 2
+        if var > best_var:
+            best_var, best_thresh = var, float(t)
+    return best_thresh
+
+
 class Decoder:
-    def __init__(self, model_id, dataset_id):
+    def __init__(self, model_id, dataset_id, dataset_name=None):
         self.model_id = model_id
         self.dataset_id = dataset_id
 
         self.model = load_model(model_id)['model']
         print(self.model)
-        self.dataset = get_loader(dataset_id)
+        self.dataset = get_loader(root=dataset_id, name=dataset_name or dataset_id)
         pass
 
     def decode(self):
@@ -34,13 +55,17 @@ class Decoder:
         raise NotImplementedError
 
 class HashDecoder(Decoder):
-    def __init__(self, model_id, dataset_id, hash_dim=4, dummy=False, level=2):
+    def __init__(self, model_id, dataset_id, hash_dim=4, dummy=False, level=2,
+                 dataset_name=None, eval_dataset_id=None, eval_kwargs=None):
         self.level = level
         self.dummy = dummy
         self.hash_dim = hash_dim
+        self.eval_dataset_id = eval_dataset_id
+        self.eval_kwargs = eval_kwargs or {}
 
         super().__init__(model_id=model_id,
                          dataset_id=dataset_id,
+                         dataset_name=dataset_name,
                          )
 
     @staticmethod
@@ -115,26 +140,28 @@ class HashDecoder(Decoder):
             if use_scatter_path:
                 cum_assign = merge_info['cumulative_assignments'][self.level]
                 Z = embs[self.level]
-
-                # sigma from internal edges only: for each supernode at self.level,
-                # find original-graph edges where both endpoints map to the same
-                # supernode. mean score of those internal edges = clean within-spotlight
-                # sigma, equivalent to original total_sigma without cross-edge pollution.
                 n_sup = Z.size(0)
                 ei_l0 = ee[0]
                 es_l0 = internals[0]['edge_scores']
-                src_sup = cum_assign[ei_l0[0]]
-                dst_sup = cum_assign[ei_l0[1]]
-                internal_mask = src_sup == dst_sup
-                if internal_mask.sum() > 0:
-                    # sum (not mean) mirrors original total_sigma: larger denser
-                    # structures accumulate more score naturally, no count weighting needed
-                    sup_scores = torch.zeros(n_sup, device=Z.device).scatter_add(
-                        0, src_sup[internal_mask], es_l0[internal_mask]
-                    )
+
+                # MotiFiestaDisc stores per-node scores at level 0 (not per-edge).
+                # detect by comparing size to n_edges: if mismatch use probas[level]
+                # directly as per-supernode scores (they carry the merged edge signals).
+                if es_l0.size(0) == ei_l0.size(1):
+                    src_sup = cum_assign[ei_l0[0]]
+                    dst_sup = cum_assign[ei_l0[1]]
+                    internal_mask = src_sup == dst_sup
+                    if internal_mask.sum() > 0:
+                        sup_scores = torch.zeros(n_sup, device=Z.device).scatter_add(
+                            0, src_sup[internal_mask], es_l0[internal_mask]
+                        )
+                    else:
+                        sup_scores = probas[self.level] if self.level < len(probas) \
+                            else torch.ones(n_sup, device=Z.device)
                 else:
-                    node_scores_l0 = merge_info['supernode_scores'][0]
-                    sup_scores = scatter_mean(node_scores_l0, cum_assign, dim=0, dim_size=n_sup)
+                    # per-supernode scores already accumulated in probas
+                    sup_scores = probas[self.level] if self.level < len(probas) \
+                        else torch.ones(n_sup, device=Z.device)
 
                 for i, x in enumerate(embs[self.level]):
                     h = hash_table.index(x.detach().numpy())[0]
@@ -177,6 +204,103 @@ class HashDecoder(Decoder):
 
         return decoded_graphs
 
+
+    def decode_multilevel(self, n_graphs=-1):
+        """decode using all pooling levels simultaneously.
+
+        hashes supernode embeddings from every level into one shared table.
+        each node's sigma score accumulates across all levels it appears in.
+        hash assignment comes from whichever level gave the node its highest score.
+        works only with the scatter path (DiscModel).
+        """
+        hash_table = LSHash(self.hash_dim, self.model.hidden_dim)
+        hash_set = set()
+        self.model.eval()
+
+        all_hashes = []
+        all_scores = []
+        all_spotlights = []
+        skipped_idx = set()
+        spot_count_base = 0
+
+        for idx, g_pair in enumerate(self.dataset['dataset_whole']):
+            if idx > n_graphs and n_graphs > -1:
+                break
+            g = g_pair['pos']
+            n_nodes = len(g.x)
+            batch = torch.zeros(n_nodes, dtype=torch.long)
+
+            with torch.no_grad():
+                embs, probas, ee, _, merge_info, internals = self.model(
+                    g.x, g.edge_index, batch, dummy=self.dummy
+                )
+
+            use_scatter = (
+                merge_info.get('spotlights') is None
+                and merge_info.get('cumulative_assignments') is not None
+            )
+            if not use_scatter or len(embs) < 2:
+                skipped_idx.add(idx)
+                all_scores.append(None)
+                all_hashes.append(None)
+                all_spotlights.append(None)
+                continue
+
+            cum_assignments = merge_info['cumulative_assignments']
+            motif_scores = torch.zeros(n_nodes, dtype=torch.float32)
+            best_score = torch.zeros(n_nodes, dtype=torch.float32)
+            g_hashes = [''] * n_nodes
+            spotlight_ids = torch.zeros(n_nodes, dtype=torch.long)
+
+            for t in range(1, len(embs)):
+                Z = embs[t]
+                cum_assign = cum_assignments[t]
+                n_sup = Z.size(0)
+                sup_scores = probas[t] if t < len(probas) else torch.ones(n_sup)
+
+                # hash all supernodes at this level
+                sup_hashes = [hash_table.index(Z[i].detach().numpy())[0] for i in range(n_sup)]
+                hash_set.update(sup_hashes)
+
+                # vectorized score accumulation
+                node_scores_t = sup_scores[cum_assign]
+                motif_scores += node_scores_t
+
+                # vectorized update of tensor fields where this level beats best so far
+                update_mask = node_scores_t > best_score
+                best_score = torch.where(update_mask, node_scores_t, best_score)
+                spotlight_ids = torch.where(
+                    update_mask,
+                    spot_count_base + cum_assign,
+                    spotlight_ids,
+                )
+
+                # hash list update — only iterate nodes that improved
+                cum_list = cum_assign.tolist()
+                for n in update_mask.nonzero(as_tuple=False).squeeze(-1).tolist():
+                    g_hashes[n] = sup_hashes[cum_list[n]]
+
+                spot_count_base += n_sup
+
+            all_scores.append(motif_scores)
+            all_hashes.append(g_hashes)
+            all_spotlights.append(spotlight_ids)
+
+        hash_idx = {h: i + 1 for i, h in enumerate(sorted(hash_set))}
+
+        decoded_graphs = []
+        for idx, g_pair in enumerate(self.dataset['dataset_whole']):
+            if idx > n_graphs and n_graphs > -1:
+                break
+            if idx in skipped_idx:
+                continue
+            motif_inds = torch.tensor([hash_idx[h] for h in all_hashes[idx]])
+            g_pair['pos'].motif_pred = motif_inds
+            g_pair['pos'].cum_scores = all_scores[idx]
+            g_pair['pos'].spotlight_ids = all_spotlights[idx]
+            decoded_graphs.append(g_pair['pos'])
+
+        return decoded_graphs
 
     @staticmethod
     def collect_output(decoded_graphs):
@@ -222,6 +346,9 @@ class HashDecoder(Decoder):
             s = torch.cat(scores_by_level[level])
             print(f"  level {level}: mean={s.mean():.4f}  std={s.std():.4f}  "
                   f"min={s.min():.4f}  max={s.max():.4f}  n={len(s)}")
+
+    def decode_subgraph_scale(self, n_graphs=-1):
+        return self.decode(n_graphs=n_graphs)
 
     def motif_sigma(self, decoded_graphs):
         _, true_motif_ids, sigma_all = HashDecoder.collect_output(decoded_graphs)
@@ -292,6 +419,25 @@ class HashDecoder(Decoder):
             if jaccard > best_jaccard:
                 best_jaccard = jaccard
         return best_jaccard
+
+    def eval_sigma_threshold(self, n_graphs=-1, top_frac=None):
+        """score-only eval: rank nodes by cum_score, threshold, compute M-Jaccard. no LSH."""
+        decoded_graphs = self.decode(n_graphs=n_graphs)
+        if not decoded_graphs:
+            return 0.0
+        sigma_all = torch.cat([g.cum_scores for g in decoded_graphs])
+        true_all = torch.cat([g.motif_id for g in decoded_graphs])
+        if top_frac is not None:
+            k = max(1, int(top_frac * len(sigma_all)))
+            threshold = torch.topk(sigma_all, k).values[-1].item()
+        else:
+            threshold = _otsu_threshold(sigma_all)
+        pred = sigma_all >= threshold
+        true_motif = true_all > 0
+        intersection = (pred & true_motif).sum().float()
+        union = (pred | true_motif).sum().float()
+        return (intersection / union).item() if union > 0 else 0.0
+
 
 if __name__ == "__main__":
     # import doctest

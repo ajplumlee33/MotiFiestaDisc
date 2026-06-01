@@ -164,6 +164,7 @@ cython_debug/
 .python-version
 css595.ipynb
 #.gitignore
+/synth-barbell-k10/
 CLAUDE.md
 /data/
 /decoded/
