@@ -11,12 +11,14 @@ def set_device(device):
     device_cache = torch.device(device) if not isinstance(device, torch.device) else device
 
 def get_device():
-    """return the active compute device: cuda > cpu (mps skipped — slower for small sparse graphs)."""
+    """return the active compute device: cuda > mps > cpu."""
     global device_cache
     if device_cache is not None:
         return device_cache
     if torch.cuda.is_available():
         device_cache = torch.device("cuda")
+    elif torch.backends.mps.is_available():
+        device_cache = torch.device("mps")
     else:
         device_cache = torch.device("cpu")
     print(f"using device: {device_cache}")
@@ -43,6 +45,20 @@ def load_model(run, permissive=False, verbose=True):
         model_dict = torch.load(f'models/{run}/{run}.pth',
                                 map_location='cpu')
         state_dict = model_dict['model_state_dict']
+
+        # backward compat: GINPool gin changed from single GINConv to ModuleList.
+        # remap pool_layers.N.gin.X → pool_layers.N.gin.0.X
+        if any(k.startswith('pool_layers.') and '.gin.nn.' in k and '.gin.0.' not in k
+               for k in state_dict):
+            remapped = {}
+            for k, v in state_dict.items():
+                if '.gin.nn.' in k and '.gin.0.' not in k:
+                    remapped[k.replace('.gin.', '.gin.0.')] = v
+                elif k.endswith('.gin.eps') and '.gin.0.' not in k:
+                    remapped[k.replace('.gin.eps', '.gin.0.eps')] = v
+                else:
+                    remapped[k] = v
+            state_dict = remapped
 
         # backward compat: dual-proj checkpoints used transform_hi/transform_lo;
         # remap transform_hi → transform and drop transform_lo / gate_net

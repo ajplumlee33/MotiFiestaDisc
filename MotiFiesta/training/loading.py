@@ -11,7 +11,7 @@ from MotiFiesta.utils.real_world import RealWorldDataset
 from MotiFiesta.utils.sys_txt import SysTxtDataset
 from MotiFiesta.utils.sys_synthetic import SysSyntheticDataset
 from MotiFiesta.utils.sys_loader import SysLoader
-from MotiFiesta.utils.bfs_decompose import BFSDecomposedDataset, LouvainDecomposedDataset
+from MotiFiesta.utils.bfs_decompose import BFSDecomposedDataset, LouvainDecomposedDataset, PrebuiltPairsDataset
 
 
 def get_loader(root,
@@ -34,11 +34,19 @@ def get_loader(root,
         Dictionary with loaders and datasets for train/test
 
     """
-    if name in ('louvain_decomp', 'synth_pairs') or 'louvain_decomp' in root:
+    if name == 'synth_pairs':
         cache = os.path.join(root, 'processed', 'data_0.pt')
         if not os.path.exists(cache):
             raise FileNotFoundError(
-                f"no cache at {cache} — run scripts/build_synth_data.py or build_data_bfs.py first"
+                f"no cache at {cache} — run scripts/build_synth_data.py first"
+            )
+        print(">>> SUCCESS: pre-built synth pairs dataset detected")
+        dataset = PrebuiltPairsDataset(root=root)
+    elif name == 'louvain_decomp' or 'louvain_decomp' in root:
+        cache = os.path.join(root, 'processed', 'data_0.pt')
+        if not os.path.exists(cache):
+            raise FileNotFoundError(
+                f"no cache at {cache} — run scripts/build_data_bfs.py first"
             )
         print(">>> SUCCESS: pre-built graph-pair dataset detected")
         dataset = LouvainDecomposedDataset(root=root)

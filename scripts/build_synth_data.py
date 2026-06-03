@@ -84,9 +84,9 @@ gs = generate_instances(
 
 for i, triplet in enumerate(gs):
     pos = triplet['pos']   # planted = motif embedded in background
-    neg = triplet['rand']  # wired   = rewired version, same node count
+    neg = triplet['neg']   # background-only (no motif) — original paper setup
     pos.num_nodes = pos.x.size(0)
-    neg.num_nodes = pos.num_nodes
+    neg.num_nodes = neg.x.size(0)
     if USE_EIGEN_PE:
         pos = laplacian_pe(pos, N_EIGEN)
         neg = laplacian_pe(neg, N_EIGEN)

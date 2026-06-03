@@ -8,82 +8,6 @@ from MotiFiesta.utils.learning_utils import get_device
 
 
 
-def compute_wl_cross_weights(batch_pos, batch_neg, ee_pos, merge_info_pos,
-                              wl_iter=3, max_spotlight_nodes=20):
-    """per-edge WL cross-similarity weights for cosine_loss.
-
-    for each edge spotlight in pos at each pooling level, extracts the induced
-    subgraph from neg at the same node indices and computes WL similarity.
-    weight = 1 - similarity: high for structurally distinct pairs (motif vs er),
-    low for similar pairs (background louvain vs er).
-
-    returns a list of float32 tensors (one per level), shape [n_edges_at_level].
-    """
-    from MotiFiesta.training.wl_kernel import (
-        wl_subtree_similarity_batch,
-        initial_labels_from_onehot,
-    )
-    from torch_geometric.utils import subgraph as pyg_subgraph
-
-    device = get_device()
-    pos_edge_index = batch_pos.edge_index.to(device)
-    neg_edge_index = batch_neg.edge_index.to(device)
-    n_nodes = batch_pos.num_nodes
-
-    pos_labels = initial_labels_from_onehot(batch_pos.x.to(device))
-    neg_labels = initial_labels_from_onehot(batch_neg.x.to(device))
-
-    spot_assign = merge_info_pos['spotlight_assignment']
-    n_id = merge_info_pos['n_id'].to(device)
-
-    weights = []
-    for level in range(len(ee_pos)):
-        edge_idx = ee_pos[level].to(device)
-        spot_t = spot_assign[level].to(device)
-        n_take = edge_idx.size(1)
-
-        pos_edges, neg_edges, counts, pos_lbls, neg_lbls, valid = [], [], [], [], [], []
-
-        for i in range(n_take):
-            u = edge_idx[0, i].item()
-            v = edge_idx[1, i].item()
-            mask = (spot_t == u) | (spot_t == v)
-            local = mask.nonzero(as_tuple=False).squeeze(-1)
-            if local.numel() == 0:
-                continue
-            global_idx = n_id[local].sort().values
-            if global_idx.size(0) > max_spotlight_nodes:
-                perm = torch.randperm(global_idx.size(0))[:max_spotlight_nodes]
-                global_idx = global_idx[perm].sort().values
-
-            n = global_idx.size(0)
-            pos_ei, _ = pyg_subgraph(global_idx, pos_edge_index,
-                                     relabel_nodes=True, num_nodes=n_nodes)
-            neg_ei, _ = pyg_subgraph(global_idx, neg_edge_index,
-                                     relabel_nodes=True, num_nodes=n_nodes)
-            pos_edges.append(pos_ei)
-            neg_edges.append(neg_ei)
-            counts.append(n)
-            pos_lbls.append(pos_labels[global_idx])
-            neg_lbls.append(neg_labels[global_idx])
-            valid.append(i)
-
-        w = torch.ones(n_take, device=device)
-        if len(valid) >= 1:
-            # combine pos and neg spotlights into one joint kernel call
-            all_edges = pos_edges + neg_edges
-            all_counts = counts + counts
-            all_labels = pos_lbls + neg_lbls
-            K = wl_subtree_similarity_batch(all_edges, all_counts, all_labels,
-                                            n_iter=wl_iter)
-            n_valid = len(valid)
-            # cross-diagonal: K[i, n_valid + i] = sim(pos_i, neg_i)
-            cross_sim = torch.stack([K[i, n_valid + i] for i in range(n_valid)])
-            for idx, edge_i in enumerate(valid):
-                w[edge_i] = (1.0 - cross_sim[idx].clamp(0.0, 1.0))
-
-        weights.append(w)
-    return weights
 
 class Controller:
     def __init__(self, since_best_threshold=1):
@@ -91,7 +15,6 @@ class Controller:
         self.modules = ['rec', 'mot']
         self.best_losses = {key: {'best_loss': float('nan'), 'since_best': 0}
                             for key in self.modules}
-        pass
 
     def keep_going(self, key):
         """ Returns True if model should keep training, false otherwise."""
@@ -108,9 +31,6 @@ class Controller:
                 self.best_losses[key]['since_best'] = 0
             elif not math.isnan(l):
                 self.best_losses[key]['since_best'] += 1
-            else:
-                pass
-        pass
 
     def state_dict(self):
         return {'since_best_threshold': self.since_best_threshold,
@@ -131,7 +51,6 @@ def print_gradients(model):
     for param in model.named_parameters():
         name, p = param
         print(name, p, p.grad, p.requires_grad, p.shape)
-    pass
 
 def motif_train(model,
                 train_loader,
@@ -153,6 +72,7 @@ def motif_train(model,
                 wl_iter=3,
                 freeze_encoder=False,
                 structural_loss_coef=1.0,
+                grad_clip=1.0,
                 ):
     """motif_train.
 
@@ -194,6 +114,12 @@ def motif_train(model,
     for epoch in range(epoch_start, epochs):
         in_warmup = epoch < stop_epochs
 
+        if epoch == stop_epochs:
+            # reset Adam moment estimates so stale rec_loss momentum doesn't
+            # distort the first freq_loss updates
+            optimizer.state.clear()
+            print("  optimizer state reset for freq_loss phase")
+
         model.train()
         model.to(get_device())
 
@@ -215,7 +141,8 @@ def motif_train(model,
             _t = time.time()
             xx_pos, pp_pos, ee_pos, _, merge_info_pos, internals_pos = model(x_pos,
                                                                               edge_index_pos,
-                                                                              batch_pos.batch
+                                                                              batch_pos.batch,
+                                                                              dummy=in_warmup,
                                                                               )
             t_fwd += time.time() - _t
 
@@ -237,10 +164,20 @@ def motif_train(model,
                         _, _, _, _, _, internals_neg = model(
                             batch_neg.x, batch_neg.edge_index, batch_neg.batch
                         )
+                    # freeze per-level GIN weights during freq_loss — protects
+                    # the rec_loss-trained embeddings from freq_loss gradient disruption.
+                    # score_net and transform still learn from freq_loss.
+                    # done once at transition (idempotent after first call).
+                    if hasattr(model, 'pool_layers') and not getattr(model, '_gin_frozen', False):
+                        for layer in model.pool_layers:
+                            if hasattr(layer, 'gin'):
+                                for p in layer.gin.parameters():
+                                    p.requires_grad_(False)
+                        model._gin_frozen = True
                     mot_loss = model.freq_loss(internals_pos, internals_neg, pp_pos,
                                                beta=beta, lam=lam, k=n_neighbors)
                 else:
-                    mot_loss = model.cosine_loss(internals_pos)
+                    raise NotImplementedError("model has no freq_loss")
                 loss += mot_loss
                 mot_loss_tot += mot_loss.item()
                 backward = True
@@ -248,6 +185,8 @@ def motif_train(model,
             if backward:
                 _t = time.time()
                 loss.backward()
+                if grad_clip is not None:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
                 optimizer.step()
                 t_bwd += time.time() - _t
 
@@ -272,7 +211,8 @@ def motif_train(model,
             with torch.no_grad():
                 xx_pos, pp_pos, ee_pos, _, merge_info_pos, internals_pos = model(x_pos,
                                                                                   edge_index_pos,
-                                                                                  batch_pos.batch
+                                                                                  batch_pos.batch,
+                                                                                  dummy=in_warmup,
                                                                                   )
             mot_loss = torch.tensor(float('nan'))
 
@@ -292,7 +232,7 @@ def motif_train(model,
                                                    beta=beta, lam=lam, k=n_neighbors)
                 else:
                     with torch.no_grad():
-                        mot_loss = model.cosine_loss(internals_pos)
+                        raise NotImplementedError("model has no freq_loss")
                 mot_loss_tot += mot_loss.item()
 
         N = max_batches if max_batches > 0  else len(test_loader)
