@@ -17,11 +17,11 @@ import os
 import torch
 from MotiFiesta.utils.synthetic import generate_instances
 
-MOTIF_TYPE   = 'clique'    # 'clique', 'star', 'barbell', 'wheel', 'lollipop', 'random'
+MOTIF_TYPE   = 'clique'
 MOTIF_SIZE   = 10
 PARENT_SIZE  = 20          # background nodes; total graph ≈ motif_size + parent_size (~2x motif size, paper appendix A.1)
 PARENT_EPROB = 0.1         # paper appendix A.1
-MAX_DEGREE   = 61
+MAX_DEGREE   = 25
 DISTORT_P    = -1          # no distortion
 N_GRAPHS     = 1000
 USE_EIGEN_PE = False       # append laplacian eigenvectors to node features
@@ -84,9 +84,9 @@ gs = generate_instances(
 
 for i, triplet in enumerate(gs):
     pos = triplet['pos']   # planted = motif embedded in background
-    neg = triplet['rand']  # wired   = rewired version, same node count
+    neg = triplet['neg']   # background-only (no motif) — original paper setup
     pos.num_nodes = pos.x.size(0)
-    neg.num_nodes = pos.num_nodes
+    neg.num_nodes = neg.x.size(0)
     if USE_EIGEN_PE:
         pos = laplacian_pe(pos, N_EIGEN)
         neg = laplacian_pe(neg, N_EIGEN)

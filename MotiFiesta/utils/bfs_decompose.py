@@ -335,6 +335,64 @@ def louvain_decompose(data, max_size=30, min_size=3, resolution=1.0,
     return subgraph_list
 
 
+class PrebuiltPairsDataset(Dataset):
+    """
+    pyg Dataset for pre-generated pos/neg pairs (e.g. from build_synth_data.py).
+
+    unlike LouvainDecomposedDataset, this class does NOT override neg.num_nodes
+    to match pos.num_nodes — pos and neg may have different node counts.
+    """
+
+    def __init__(self, root, transform=None, pre_transform=None):
+        super().__init__(root, transform, pre_transform)
+        self._cache = [
+            torch.load(
+                os.path.join(self.processed_dir, f'data_{i}.pt'),
+                weights_only=False,
+            )
+            for i in range(self.len())
+        ]
+        # ensure explicit num_nodes on both graphs so pyg collator doesn't crash
+        for pair in self._cache:
+            if pair['pos'].num_nodes is None:
+                pair['pos'].num_nodes = pair['pos'].x.size(0)
+            if pair['neg'].num_nodes is None:
+                pair['neg'].num_nodes = pair['neg'].x.size(0)
+
+    @property
+    def num_features(self):
+        return torch.load(
+            os.path.join(self.processed_dir, 'data_0.pt'),
+            weights_only=False,
+        )['pos'].num_features
+
+    @property
+    def raw_file_names(self):
+        return []
+
+    @property
+    def processed_file_names(self):
+        return ['data_0.pt']
+
+    def download(self):
+        pass
+
+    def len(self):
+        return len([
+            f for f in os.listdir(self.processed_dir)
+            if f.startswith('data_') and f.endswith('.pt')
+        ])
+
+    def get(self, idx):
+        return self._cache[idx]
+
+    def process(self):
+        raise RuntimeError(
+            "PrebuiltPairsDataset has no process() — generate data with "
+            "scripts/build_synth_data.py first."
+        )
+
+
 class LouvainDecomposedDataset(Dataset):
     """
     pyg Dataset of Louvain-decomposed subgraph pairs.
