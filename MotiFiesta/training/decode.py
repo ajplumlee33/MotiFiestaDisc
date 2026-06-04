@@ -450,16 +450,15 @@ class HashDecoder(Decoder):
         # collect all the graphs into one big tensor
         motifs_pred_all, true_motif_ids, sigma_all = HashDecoder.collect_output(decoded_graphs)
 
-        # rank motifs by count, sigma, or sigma weighted by count
+        # rank motifs by count or average sigma per bucket.
+        # main branch always uses average sigma: scatter_add / counts.
         motif_ids, counts = torch.unique(motifs_pred_all, return_counts=True)
         if rank_by == 'count':
             rank_scores = counts.float()
-        elif rank_by == 'sigma':
-            # sum sigma per bucket: larger denser structures accumulate more,
-            # mirrors original total_sigma without needing count stabilisation
-            rank_scores = torch.zeros_like(motif_ids, dtype=torch.float32).scatter_add(0, motifs_pred_all, sigma_all)
         else:
-            rank_scores = torch.zeros_like(motif_ids, dtype=torch.float32).scatter_add(0, motifs_pred_all, sigma_all) / counts
+            # 'sigma': average sigma per bucket — matches main branch sigma_avg = scatter_add / counts
+            rank_scores = torch.zeros_like(motif_ids, dtype=torch.float32).scatter_add(
+                0, motifs_pred_all, sigma_all) / counts
 
         # rank motifs
         motifs_sorted = torch.argsort(rank_scores, descending=True)

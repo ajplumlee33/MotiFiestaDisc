@@ -164,10 +164,8 @@ def motif_train(model,
                         _, _, _, _, _, internals_neg = model(
                             batch_neg.x, batch_neg.edge_index, batch_neg.batch
                         )
-                    # freeze per-level GIN weights during freq_loss — protects
-                    # the rec_loss-trained embeddings from freq_loss gradient disruption.
-                    # score_net and transform still learn from freq_loss.
-                    # done once at transition (idempotent after first call).
+                    # freeze per-level GIN during freq_loss — transform and score_net
+                    # both train from freq_loss; GIN stays fixed to preserve rec_loss embeddings.
                     if hasattr(model, 'pool_layers') and not getattr(model, '_gin_frozen', False):
                         for layer in model.pool_layers:
                             if hasattr(layer, 'gin'):

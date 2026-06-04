@@ -51,7 +51,6 @@ if function == 'train':
     parser.add_argument("--estimator", "-es", type=str, default='knn', help="Which density estimator to use for the motif agg. step")
     parser.add_argument("--n-neighbors", "-nn", type=int, default=30, help="Number of neighbors")
     parser.add_argument("--volume", "-vv", action='store_true', default=False, help="Use d-sphere volume to normalize density with kNN.")
-    parser.add_argument('--rec-kernel', choices=['wwl', 'wl', 'cosine', 'sinkhorn', 'geomloss'], default='cosine')
     parser.add_argument('--edge-sample-rate', type=float, default=1.0)
     parser.add_argument('--wl-iter', type=int, default=3, help="WL subtree iterations for rec_loss_wl")
     parser.add_argument("--sil-momentum", type=float, default=0.95,
@@ -132,7 +131,6 @@ if function == 'train':
                         'n_heads': args.n_heads,
                         'gin_layers': args.gin_pool_layers,
                         'wl_hops': args.wl_hops,
-                        'rec_kernel': args.rec_kernel,
                          },
                'train': {
                         'epochs': args.epochs,

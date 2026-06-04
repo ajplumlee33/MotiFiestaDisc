@@ -14,12 +14,13 @@ def _mlp(in_dim, out_dim):
 
 
 def _greedy_contract(edge_index, scores, n_nodes):
-    """greedy edge contraction ranked by score, vectorized.
+    """greedy edge contraction ranked by score, vectorized. MPS-native.
 
     mutual-best rounds: selects all edges where both endpoints' best remaining
     incident edge is that edge. equivalent to sequential greedy.
-    runs on cpu — mps scatter_ uses first-write-wins for duplicate indices which
-    breaks the state tracking (taken/cluster). cpu has correct last-write-wins.
+
+    runs on cpu — boolean indexing (`order[sel_mask]`) causes ~130ms mps sync per round
+    which is slower than cpu execution. cpu has no sync overhead for bool ops.
     """
     orig_device = scores.device
     edge_index = edge_index.cpu()
@@ -45,14 +46,14 @@ def _greedy_contract(edge_index, scores, n_nodes):
         eff_rank = torch.where(active, ranks, torch.full_like(ranks, INF))
         both_eff = torch.cat([eff_rank, eff_rank])
 
-        # min-scatter via "last write wins": sort descending so inactive (INF) writes first,
-        # then active worst→best; lowest rank is last and survives per node.
-        # avoids scatter_reduce_(amin) which is unimplemented on MPS.
+        # min-scatter via "last write wins" — avoids scatter_reduce_(amin) (unimplemented on MPS)
         desc = torch.argsort(both_eff, descending=True)
         best = torch.full((n_nodes,), INF, dtype=torch.long, device=device)
         best.scatter_(0, both_nodes[desc], both_eff[desc])
 
         sel_mask = active & (best[u_ord] == ranks) & (best[v_ord] == ranks)
+
+        # boolean index once per round — sync is acceptable (2-4 rounds total)
         sel_orig = order[sel_mask]
         if sel_orig.numel() == 0:
             break
@@ -61,6 +62,8 @@ def _greedy_contract(edge_index, scores, n_nodes):
         sel_v = edge_index[1, sel_orig]
         n_sel = sel_orig.numel()
         ids = torch.arange(next_id, next_id + n_sel, device=device)
+
+        # mutual-best guarantees sel_u and sel_v have no duplicates — safe scatter_
         cluster[sel_u] = ids
         cluster[sel_v] = ids
         taken[sel_u] = True
@@ -98,7 +101,8 @@ class GINPool(torch.nn.Module):
     per-level GIN aggregates from all neighboring supernodes at the current graph scale,
     giving each level structural awareness the main branch's linear transform lacks.
     rec_loss (geomloss WWL) supervises x_merged at each level; freq_loss trains
-    score_net only (GIN is frozen to protect learned embeddings).
+    score_net only (score_net uses GIN output directly, so transform is never
+    touched by freq_loss — clean separation of rec_loss vs freq_loss objectives).
     """
 
     def __init__(self, dim, gin_layers=1):
@@ -126,15 +130,16 @@ class GINPool(torch.nn.Module):
 
         feats_t = self.transform(feats)
         if dummy:
-            # random bernoulli skip — matches main branch's `if r > 0.5: skip` per edge.
-            # truly random contractions (not biased by mutual-best on uniform scores).
-            edge_score = torch.bernoulli(
-                torch.full((edge_index.size(1),), 0.5, device=device)
-            ).clamp(min=1e-6)
+            # uniform random scores — matches main branch's stochastic skip (r ~ Uniform(0,1))
+            edge_score = torch.rand(edge_index.size(1), device=device).clamp(min=1e-6)
         else:
-            edge_score = torch.sigmoid(
-                self.score_net(feats_t[edge_index[0]] + feats_t[edge_index[1]]).squeeze(-1)
-            )
+            # match main branch: score_net(transform(x_u + x_v)) adds bias once.
+            # feats_t[u]+feats_t[v] adds bias twice; subtract one copy to match.
+            # transform(x_u+x_v) = feats_t[u] + feats_t[v] - transform.bias
+            edge_merged = feats_t[edge_index[0]] + feats_t[edge_index[1]]
+            if self.transform.bias is not None:
+                edge_merged = edge_merged - self.transform.bias
+            edge_score = torch.sigmoid(self.score_net(edge_merged).squeeze(-1))
         edge_batch = node_batch[edge_index[0]]
 
         new_cluster, n_new, _, selected = _greedy_contract(
@@ -165,12 +170,12 @@ class MotiFiestaDisc(torch.nn.Module):
     each GINPool applies GIN message passing on the contracted graph at that scale,
     then scores edges, contracts greedily, and produces supernode embeddings.
     rec_loss (GeomLoss WWL): trains GIN + transform via OT-based kernel matching.
-    freq_loss (kNN density contrast): trains score_net only — GIN frozen to protect
-    the structural embeddings rec_loss builds.
+    freq_loss (kNN density contrast on x_merged): trains score_net only. matches main
+    branch which uses x_merged and pp[t] (supernode scores).
     """
 
     def __init__(self, n_features=61, dim=32, depth=4, gin_layers=1,
-                 steps=None, wl_hops=1, rec_kernel='cosine', **kwargs):
+                 steps=None, wl_hops=1, **kwargs):
         super().__init__()
         if steps is not None:
             depth = steps
@@ -178,7 +183,6 @@ class MotiFiestaDisc(torch.nn.Module):
         self.depth = depth
         self.wl_hops = wl_hops
         self.n_features = n_features
-        self.rec_kernel = rec_kernel
 
         self.input_proj = torch.nn.Linear(n_features * (1 + wl_hops), dim)
 
@@ -320,16 +324,9 @@ class MotiFiestaDisc(torch.nn.Module):
         return torch.exp(-dist.clamp(min=0)).reshape(n, n)
 
     def rec_loss(self, xx, internals_pos, batch_pos, num_nodes=40):
-        """structural anchor loss supervising supernode embeddings via kernel matching.
-
-        rec_kernel='geomloss': K_true = exp(-Wasserstein(spotlight_WL_features))
-          computed via GeomLoss SamplesLoss. level 0: RBF on raw features.
-          level t>0: internal-edge 4-hop WL on spotlight.  dummy warmup keeps contractions
-          stable so K_true doesn't shift as GIN trains.
-
-        rec_kernel='cosine': K_true = cosine gram of scatter_sum WL hop features.
-
-        K_predict = cosine gram of internals[t]['x_merged'] at each level —
+        """structural anchor loss: K_predict = cosine gram of internals[t]['x_merged'],
+        K_true = GeomLoss Wasserstein on internal-edge 4-hop WL spotlight features.
+        matches main branch wwl(subgraphs, features, num_iterations=4).
         trains GIN and transforms; score_net receives no gradient from rec_loss.
         """
         device = next(self.parameters()).device
@@ -349,16 +346,6 @@ class MotiFiestaDisc(torch.nn.Module):
                 wl_hops_list.append(nbr)
                 cur = nbr
 
-        def _cosine_gram(hop_feats):
-            """sum of per-hop cosine gram matrices."""
-            def _gram(h):
-                h_n = F.normalize(h, dim=-1)
-                return h_n @ h_n.T
-            K = _gram(hop_feats[0])
-            for h in hop_feats[1:]:
-                K = K + _gram(h)
-            return K / len(hop_feats)
-
         n_nodes_orig = internals_pos[0]['x_merged'].size(0)
         if n_nodes_orig < 2:
             return torch.zeros(1, device=device, requires_grad=True).squeeze()
@@ -367,8 +354,6 @@ class MotiFiestaDisc(torch.nn.Module):
         n_levels = 0
 
         for t, internal in enumerate(internals_pos):
-            # use supernode embeddings directly — matches main branch rec_loss
-            # which uses internals[level]['x_merged'] as K_predict
             z_t = internal['x_merged']
             cum_assign = internal['cum_assign'].to(device)
             n_super = z_t.size(0)
@@ -376,46 +361,32 @@ class MotiFiestaDisc(torch.nn.Module):
             if n_super < 2:
                 continue
 
-            # subsample supernodes — keeps Sinkhorn cost O(k^2)
+            # subsample supernodes — keeps GeomLoss cost O(k^2)
             perm = None
             if n_super > num_nodes:
                 perm = torch.randperm(n_super, device=device)[:num_nodes]
                 z_t = z_t[perm]
 
-            if self.rec_kernel in ('sinkhorn', 'geomloss'):
-                if t == 0:
-                    x_sub = x_base if perm is None else x_base[perm]
-                    K_true = torch.exp(-torch.cdist(x_sub, x_sub)).to(device)
-                else:
-                    # internal-edge 4-hop WL — stable because dummy scores fix contractions
-                    with torch.no_grad():
-                        internal_mask = cum_assign[src] == cum_assign[dst]
-                        src_int = src[internal_mask]
-                        dst_int = dst[internal_mask]
-                        sub_hops = [x_base]
-                        cur = x_base
-                        for _ in range(4):
-                            nbr = torch.zeros(n_nodes_orig, n_feat, device=device).scatter_add_(
-                                0, dst_int.unsqueeze(1).expand(-1, n_feat), cur[src_int]
-                            )
-                            sub_hops.append(nbr)
-                            cur = nbr
-                    K_true = self._wwl_gram(sub_hops, cum_assign, n_super, perm).to(device)
+            if t == 0:
+                # level 0: single-node spotlights → OT = L2 → K = exp(-||x_i-x_j||)
+                x_sub = x_base if perm is None else x_base[perm]
+                K_true = torch.exp(-torch.cdist(x_sub, x_sub)).to(device)
             else:
-                if t == 0:
-                    K_true = _cosine_gram(wl_hops_list)
-                    if perm is not None:
-                        K_true = K_true[perm][:, perm]
-                else:
-                    ci_feat = cum_assign.unsqueeze(1)
-                    super_hops = [
-                        torch.zeros(n_super, n_feat, device=device).scatter_add_(
-                            0, ci_feat.expand(-1, n_feat), h)
-                        for h in wl_hops_list
-                    ]
-                    K_true = _cosine_gram(super_hops)
-                    if perm is not None:
-                        K_true = K_true[perm][:, perm]
+                # internal-edge 4-hop WL on spotlight subgraphs — matches main branch
+                # wwl(subgraphs, node_features, num_iterations=4)
+                with torch.no_grad():
+                    internal_mask = cum_assign[src] == cum_assign[dst]
+                    src_int = src[internal_mask]
+                    dst_int = dst[internal_mask]
+                    sub_hops = [x_base]
+                    cur = x_base
+                    for _ in range(4):
+                        nbr = torch.zeros(n_nodes_orig, n_feat, device=device).scatter_add_(
+                            0, dst_int.unsqueeze(1).expand(-1, n_feat), cur[src_int]
+                        )
+                        sub_hops.append(nbr)
+                        cur = nbr
+                K_true = self._wwl_gram(sub_hops, cum_assign, n_super, perm).to(device)
 
             K_predict = F.normalize(z_t, dim=-1) @ F.normalize(z_t, dim=-1).T
             loss = loss + F.mse_loss(K_predict, K_true)
@@ -424,11 +395,10 @@ class MotiFiestaDisc(torch.nn.Module):
         return loss / max(n_levels, 1)
 
     def freq_loss(self, internals_pos, internals_neg, pp, beta=1, lam=1.0, k=30):
-        """kNN density contrast loss — trains score_net (GIN frozen during this phase).
+        """kNN density contrast loss — trains score_net only.
 
-        euclidean kNN on x_edge (per-edge representations),
-        scores from edge_scores_raw. gradient: freq_loss → s → score_net → transform.
-        GIN weights are frozen externally in train.py to preserve rec_loss embeddings.
+        euclidean kNN on x_edge (per-edge representations), scores from edge_scores_raw.
+        gradient: freq_loss → s → score_net → transform (GIN frozen by train.py).
         """
         device = next(self.parameters()).device
 
@@ -455,10 +425,18 @@ class MotiFiestaDisc(torch.nn.Module):
             rho_neg = _knn_radius(x_pos, x_neg, k=k_eff)
             delta_f = rho_pos - rho_neg
 
-            tot_loss = tot_loss + (-s.clamp(min=1e-6) * torch.exp(-beta * delta_f.clamp(min=-10, max=10))).mean()
+            # structural weight: amplify edges far from the neg distribution center.
+            # edges structurally distinct from background (motif-like) get higher weight,
+            # letting the training signal leverage the already-good GIN embeddings.
+            neg_center = x_neg.mean(0)
+            struct_dist = torch.cdist(x_pos, neg_center.unsqueeze(0)).squeeze(-1)
+            struct_w = (struct_dist / struct_dist.mean().clamp(min=1e-8)).detach()
+
+            tot_loss = tot_loss + (-struct_w * s.clamp(min=1e-6) * torch.exp(-beta * delta_f.clamp(min=-10, max=10))).mean()
             tot_loss = tot_loss + lam * s.clamp(min=1e-6).pow(2.0).mean()
             n_active += 1
 
         if n_active == 0:
             return torch.zeros(1, device=device, requires_grad=True).squeeze()
-        return tot_loss / n_active
+        # divide by model.depth (= model.steps) matching main branch `tot_loss /= steps`
+        return tot_loss / self.depth
