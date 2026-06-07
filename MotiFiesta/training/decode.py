@@ -137,14 +137,14 @@ class HashDecoder(Decoder):
 
             use_scatter_path = (
                 merge_info.get('spotlights') is None
-                and merge_info.get('cumulative_assignments') is not None
+                and merge_info.get('merge_history') is not None
             )
 
             if use_scatter_path:
-                cum_assign = merge_info['cumulative_assignments'][self.level]
+                merge_history = merge_info['merge_history'][self.level]
                 Z = embs[self.level]
                 n_sup = Z.size(0)
-                cum_all = merge_info['cumulative_assignments']
+                cum_all = merge_info['merge_history']
 
                 # total_sigma equivalent: bottom-up accumulation across levels 1..L.
                 # at each level, inherited score from children + contraction edge score.
@@ -166,7 +166,7 @@ class HashDecoder(Decoder):
 
                 for i, x in enumerate(embs[self.level]):
                     h = hash_table.index(x.detach().cpu().numpy())[0]
-                    spotlight = (cum_assign == i).nonzero(as_tuple=False).flatten().tolist()
+                    spotlight = (merge_history == i).nonzero(as_tuple=False).flatten().tolist()
                     score = sup_scores[i].item()
                     hash_set.add(h)
                     for node in spotlight:
@@ -228,22 +228,22 @@ class HashDecoder(Decoder):
                 embs, probas, _, _, merge_info, _ = self.model(
                     g.x.float().to(self.device), g.edge_index.to(self.device), batch
                 )
-            if merge_info.get('cumulative_assignments') is None:
+            if merge_info.get('merge_history') is None:
                 skipped.add(idx)
                 for lvl in range(1, depth + 1):
                     all_hashes_by_level[lvl].append(None)
                     all_scores_by_level[lvl].append(None)
                 continue
-            cum_assignments = merge_info['cumulative_assignments']
+            merge_history_all = merge_info['merge_history']
             for lvl in range(1, min(depth + 1, len(embs))):
                 Z = embs[lvl]
-                cum_assign = cum_assignments[lvl].cpu()
+                mh = merge_history_all[lvl].cpu()
                 n_sup = Z.size(0)
                 sup_scores = probas[lvl].cpu() if lvl < len(probas) else torch.ones(n_sup)
                 hashes = [tables[lvl].index(Z[i].detach().cpu().numpy())[0] for i in range(n_sup)]
                 hash_sets[lvl].update(hashes)
-                motif_scores = sup_scores[cum_assign]
-                node_hashes = [hashes[i] for i in cum_assign.tolist()]
+                motif_scores = sup_scores[mh]
+                node_hashes = [hashes[i] for i in mh.tolist()]
                 all_hashes_by_level[lvl].append(node_hashes)
                 all_scores_by_level[lvl].append(motif_scores.cpu())
 
@@ -300,7 +300,7 @@ class HashDecoder(Decoder):
 
             use_scatter = (
                 merge_info.get('spotlights') is None
-                and merge_info.get('cumulative_assignments') is not None
+                and merge_info.get('merge_history') is not None
             )
             if not use_scatter or len(embs) < 2:
                 skipped_idx.add(idx)
@@ -309,7 +309,7 @@ class HashDecoder(Decoder):
                 all_spotlights.append(None)
                 continue
 
-            cum_assignments = merge_info['cumulative_assignments']
+            merge_history_all = merge_info['merge_history']
             motif_scores = torch.zeros(n_nodes, dtype=torch.float32, device=self.device)
             best_score = torch.zeros(n_nodes, dtype=torch.float32, device=self.device)
             g_hashes = [''] * n_nodes
@@ -318,23 +318,23 @@ class HashDecoder(Decoder):
             # precompute total_sigma at every level using bottom-up accumulation
             total_sigma_by_level = {}
             scores_t = probas[1].cpu() if len(probas) > 1 else torch.zeros(
-                int(cum_assignments[1].max().item()) + 1 if len(cum_assignments) > 1 else 1)
+                int(merge_history_all[1].max().item()) + 1 if len(merge_history_all) > 1 else 1)
             total_sigma_by_level[1] = scores_t
             for t in range(2, len(embs)):
-                if t >= len(probas) or t >= len(cum_assignments):
+                if t >= len(probas) or t >= len(merge_history_all):
                     break
-                pairs = torch.stack([cum_assignments[t - 1].cpu(), cum_assignments[t].cpu()], dim=1)
+                pairs = torch.stack([merge_history_all[t - 1].cpu(), merge_history_all[t].cpu()], dim=1)
                 unique_pairs = torch.unique(pairs, dim=0)
                 src = unique_pairs[:, 0]
                 dst = unique_pairs[:, 1]
-                n_sup_t = int(cum_assignments[t].max().item()) + 1
+                n_sup_t = int(merge_history_all[t].max().item()) + 1
                 inherited = torch.zeros(n_sup_t).scatter_add(0, dst, scores_t[src])
                 scores_t = inherited + probas[t].cpu()
                 total_sigma_by_level[t] = scores_t
 
             for t in range(1, len(embs)):
                 Z = embs[t]
-                cum_assign = cum_assignments[t]
+                mh = merge_history_all[t]
                 n_sup = Z.size(0)
                 sup_scores = total_sigma_by_level.get(t, probas[t] if t < len(probas)
                                                       else torch.zeros(n_sup)).to(self.device)
@@ -344,7 +344,7 @@ class HashDecoder(Decoder):
                 hash_set.update(sup_hashes)
 
                 # vectorized score accumulation
-                node_scores_t = sup_scores[cum_assign]
+                node_scores_t = sup_scores[mh]
                 motif_scores += node_scores_t
 
                 # vectorized update of tensor fields where this level beats best so far
@@ -352,12 +352,12 @@ class HashDecoder(Decoder):
                 best_score = torch.where(update_mask, node_scores_t, best_score)
                 spotlight_ids = torch.where(
                     update_mask,
-                    spot_count_base + cum_assign,
+                    spot_count_base + mh,
                     spotlight_ids,
                 )
 
                 # hash list update — only iterate nodes that improved
-                cum_list = cum_assign.tolist()
+                cum_list = mh.tolist()
                 for n in update_mask.nonzero(as_tuple=False).squeeze(-1).tolist():
                     g_hashes[n] = sup_hashes[cum_list[n]]
 

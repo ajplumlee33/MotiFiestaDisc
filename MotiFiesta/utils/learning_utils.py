@@ -46,7 +46,7 @@ def load_model(run, permissive=False, verbose=True):
                                 map_location='cpu')
         state_dict = model_dict['model_state_dict']
 
-        # backward compat: GINPool gin changed from single GINConv to ModuleList.
+        # backward compat: EdgePool gin changed from single GINConv to ModuleList.
         # remap pool_layers.N.gin.X → pool_layers.N.gin.0.X
         if any(k.startswith('pool_layers.') and '.gin.nn.' in k and '.gin.0.' not in k
                for k in state_dict):
