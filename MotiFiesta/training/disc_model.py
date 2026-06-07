@@ -101,10 +101,10 @@ class EdgePool(torch.nn.Module):
     touched by freq_loss — clean separation of rec_loss vs freq_loss objectives).
     """
 
-    def __init__(self, dim, gin_layers=1):
+    def __init__(self, dim):
         super().__init__()
         self.gin = torch.nn.ModuleList(
-            [GINConv(_mlp(dim, dim)) for _ in range(gin_layers)]
+            [GINConv(_mlp(dim, dim))]
         )
         self.transform = torch.nn.Linear(dim, dim)
         self.score_net = torch.nn.Linear(dim, 1)
@@ -173,13 +173,11 @@ class MotiFiestaDisc(torch.nn.Module):
     freq_loss (kNN density contrast on x_merged): trains score_net only.
     """
 
-    def __init__(self, n_features=61, dim=32, depth=4, gin_layers=1,
-                 steps=None, wl_hops=1, **kwargs):
+    def __init__(self, n_features=61, dim=32, steps=4,
+                 wl_hops=1, **kwargs):
         super().__init__()
-        if steps is not None:
-            depth = steps
         self.dim = dim
-        self.depth = depth
+        self.steps = steps
         self.wl_hops = wl_hops
         self.n_features = n_features
 
@@ -187,7 +185,7 @@ class MotiFiestaDisc(torch.nn.Module):
 
         # per-level pool layers: each owns gin + transform + score_net
         self.pool_layers = torch.nn.ModuleList(
-            [EdgePool(dim, gin_layers=gin_layers) for _ in range(depth)]
+            [EdgePool(dim) for _ in range(steps)]
         )
 
         self.layers = self.pool_layers  # backward compat alias
@@ -438,5 +436,5 @@ class MotiFiestaDisc(torch.nn.Module):
 
         if n_active == 0:
             return torch.zeros(1, device=device, requires_grad=True).squeeze()
-        # divide by model.depth (= model.steps) matching main branch `tot_loss /= steps`
-        return tot_loss / self.depth
+        # divide by steps matching main branch `tot_loss /= steps`
+        return tot_loss / self.steps
