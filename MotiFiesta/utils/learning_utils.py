@@ -4,12 +4,17 @@ import json
 import torch
 
 device_cache = None
+
 def get_device():
     global device_cache
     if device_cache is None:
-        device_cache = torch.device("cuda") if torch.cuda.is_available() \
-            else torch.device("cpu")
-        #device_cache = torch.device("cpu")
+        if torch.cuda.is_available():
+            device_cache = torch.device("cuda")
+        elif torch.backends.mps.is_available():
+            device_cache = torch.device("mps")
+        else:
+            device_cache = torch.device("cpu")
+        print(f"using device: {device_cache}")
     return device_cache
 
 def load_data(run, batch_size=2, background_only=False):

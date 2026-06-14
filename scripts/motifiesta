@@ -1,4 +1,4 @@
-#!/urs/bin/env/ python
+#!/usr/bin/env python
 
 import sys
 import pickle
@@ -15,6 +15,7 @@ from MotiFiesta.utils.learning_utils import dump_model_hparams
 from MotiFiesta.utils.learning_utils import load_model
 from MotiFiesta.utils.learning_utils import load_data
 from MotiFiesta.utils.learning_utils import make_dirs
+from MotiFiesta.utils.learning_utils import get_device
 
 
 FUNCTIONS = ['train', 'test', 'build', 'browse', 'eval']
@@ -31,6 +32,8 @@ print(f"== {function} mode ==")
 if function == 'train':
     parser = argparse.ArgumentParser()
     parser.add_argument("--name", "-n", type=str, default="default")
+    parser.add_argument("--mode", type=str, default="default", choices=["default", "disc"],
+                        help="default: MotiFiestaModel + motif_train. disc: MotiFiestaDisc + disc_train.")
     parser.add_argument("--dataset", "-da", type=str, default='synthetic')
     parser.add_argument("--data_root", type=str, default='.')
     parser.add_argument("--restart", "-r", action='store_true', default=False,  help='Restart model.')
@@ -38,7 +41,7 @@ if function == 'train':
     # training  loop
     parser.add_argument("--batch-size", "-b", type=int, default=16)
     parser.add_argument("--max-batches", "-m", type=int, default=-1)
-    parser.add_argument("--epochs", "-e", type=int, default=200)
+    parser.add_argument("--epochs", "-e", type=int, default=40)
     parser.add_argument("--stop-epochs", type=int, default=30, help="Number of epochs to train embeddings before doing motifs.")
     parser.add_argument("--attributed", default=False, action='store_true', help="Use attributed graphs. If False, use node degree as features.")
 
@@ -57,76 +60,128 @@ if function == 'train':
     parser.add_argument("--merge-method", default="sum", help="Edge merge method: (sum, cat, set2set)")
     parser.add_argument("--hard-embed", action='store_true', help="Whether to use hard embedding using degree histogram. ")
 
+    # disc-mode args (ignored in default mode)
+    parser.add_argument("--hidden-dim", type=int, default=32, help="GIN hidden dimension (disc mode).")
+    parser.add_argument("--gin-layers", type=int, default=2, help="GIN depth per induced subgraph (disc mode).")
+    parser.add_argument("--k", type=int, default=30, help="kNN neighbors for freq_loss (disc mode).")
+    parser.add_argument("--rwse-steps", type=int, default=8, help="RWSE walk length (disc mode).")
+    parser.add_argument("--walk-lens", type=str, default="4,8,12", help="comma-separated snowball walk lengths per level (disc mode).")
+    parser.add_argument("--n-walks", type=int, default=4, help="snowball walks per anchor node (disc mode).")
+    parser.add_argument("--wl-hops", type=int, default=1, help="WL neighbor-sum hops for full-graph feature augmentation (disc mode).")
+    parser.add_argument("--warmup-epochs", type=int, default=5, help="epochs of rec_loss encoder warmup before freq_loss (disc mode).")
+
     args, _ = parser.parse_known_args()
     print(args)
 
     make_dirs(args.name)
 
-    hparams = {'model':{
-                        'dim': args.dim,
-                        'steps': args.steps,
-                        'pool_dummy': args.pool_dummy,
-                        'edge_score_method': args.score_method,
-                        'merge_method': args.merge_method,
-                        'hard_embed': args.hard_embed,
-                         },
-               'train': {
-                        'epochs': args.epochs,
-                        'batch_size': args.batch_size,
-                        'max_batches': args.max_batches,
-                        'dataset': args.dataset,
-                        'lambda': args.lam,
-                        'beta': args.beta,
-                        'stop_epochs': args.stop_epochs,
-                        'estimator': args.estimator,
-                        'k': args.n_neighbors,
-                        'volume': args.volume,
-                        'attributed': args.attributed,
-                        }
-                }
-
     print(">>> loading data")
     data = get_loader(
                       name=args.dataset,
                       root=args.data_root,
-                      batch_size=hparams['train']['batch_size'],
-                      attributed=hparams['train']['attributed']
+                      batch_size=args.batch_size,
+                      attributed=args.attributed if hasattr(args, 'attributed') else False,
                       )
-
-    hparams['model']['n_features'] = data['dataset_whole'].num_features
-    print(data['dataset_whole'].num_features)
-    dump_model_hparams(args.name, hparams)
+    n_features = data['dataset_whole'].num_features
+    print(n_features)
 
     print(">>> building model")
 
-    if args.restart:
-        print(f"Restarting training with ID: {args.name}")
-        model_dict = load_model(args.name)
-        model = model_dict['model']
-        epoch_start = model_dict['epoch']
-        optimizer = model_dict['optimizer']
-        controller_state = model_dict['controller_state_dict']
+    if args.mode == 'disc':
+        from MotiFiesta.training.disc_model import MotiFiestaDisc
+        from MotiFiesta.training.disc_train import disc_train
+        import torch
+        walk_lens = [int(x) for x in args.walk_lens.split(',')]
+        disc_hparams = {
+            'model_type': 'disc',
+            'hidden_dim': args.hidden_dim,
+            'gin_layers': args.gin_layers,
+            'rwse_steps': args.rwse_steps,
+            'walk_lens': walk_lens,
+            'n_walks': args.n_walks,
+            'wl_hops': args.wl_hops,
+            'n_features': n_features,
+        }
+        hparams = {'model': disc_hparams, 'train': {
+            'epochs': args.epochs,
+            'batch_size': args.batch_size,
+            'k': args.k,
+            'lam': args.lam,
+            'beta': args.beta,
+            'warmup_epochs': args.warmup_epochs,
+        }}
+        dump_model_hparams(args.name, hparams)
+        if args.restart:
+            print(f"Restarting training with ID: {args.name}")
+            ckpt = torch.load(f'models/{args.name}/{args.name}.pth', map_location='cpu')
+            model = MotiFiestaDisc(**disc_hparams)
+            model.load_state_dict(ckpt['model_state_dict'])
+            optimizer = torch.optim.Adam(model.parameters())
+            optimizer.load_state_dict(ckpt['optimizer_state_dict'])
+            epoch_start = ckpt['epoch'] + 1
+            controller_state = ckpt['controller_state_dict']
+        else:
+            model = MotiFiestaDisc(**disc_hparams)
+            epoch_start, optimizer, controller_state = 0, None, None
+        print(model)
+        print(">>> training...")
+        disc_train(
+            model,
+            train_loader=data['loader_train'],
+            test_loader=data['loader_test'],
+            model_name=args.name,
+            epochs=args.epochs,
+            max_batches=args.max_batches,
+            warmup_epochs=args.warmup_epochs,
+            n_neighbors=args.k,
+            beta=args.beta,
+            lam=args.lam,
+            epoch_start=epoch_start,
+            optimizer=optimizer,
+            controller_state=controller_state,
+        )
     else:
-        model = MotiFiestaModel(**hparams['model'])
-        epoch_start, optimizer, controller_state = 0, None, None
-    print(model)
+        hparams = {'model': {
+            'dim': args.dim, 'steps': args.steps, 'pool_dummy': args.pool_dummy,
+            'edge_score_method': args.score_method, 'merge_method': args.merge_method,
+            'hard_embed': args.hard_embed, 'gin_layers': args.gin_layers,
+            'n_features': n_features,
+        }, 'train': {
+            'epochs': args.epochs, 'batch_size': args.batch_size,
+            'max_batches': args.max_batches, 'dataset': args.dataset,
+            'lambda': args.lam, 'beta': args.beta, 'stop_epochs': args.stop_epochs,
+            'estimator': args.estimator, 'k': args.n_neighbors,
+            'volume': args.volume, 'attributed': args.attributed,
+        }}
+        dump_model_hparams(args.name, hparams)
+        if args.restart:
+            print(f"Restarting training with ID: {args.name}")
+            model_dict = load_model(args.name)
+            model = model_dict['model']
+            epoch_start = model_dict['epoch']
+            optimizer = model_dict['optimizer']
+            controller_state = model_dict['controller_state_dict']
+        else:
+            model = MotiFiestaModel(**hparams['model'])
+            epoch_start, optimizer, controller_state = 0, None, None
+        print(model)
+        print(">>> training...")
+        motif_train(model,
+                    train_loader=data['loader_train'],
+                    test_loader=data['loader_test'],
+                    model_name=args.name,
+                    epochs=args.epochs,
+                    max_batches=args.max_batches,
+                    stop_epochs=args.stop_epochs,
+                    estimator=args.estimator,
+                    volume=args.volume,
+                    n_neighbors=args.n_neighbors,
+                    hard_embed=args.hard_embed,
+                    beta=args.beta,
+                    lam=args.lam,
+                    epoch_start=epoch_start,
+                    optimizer=optimizer,
+                    controller_state=controller_state
+                    )
 
-    print(">>> training...")
-    motif_train(model,
-                train_loader=data['loader_train'],
-                test_loader=data['loader_test'],
-                model_name=args.name,
-                epochs=args.epochs,
-                max_batches=args.max_batches,
-                stop_epochs=args.stop_epochs,
-                estimator=args.estimator,
-                volume=args.volume,
-                n_neighbors=args.n_neighbors,
-                hard_embed=args.hard_embed,
-                beta=args.beta,
-                lam=args.lam,
-                epoch_start=epoch_start,
-                optimizer=optimizer,
-                controller_state=controller_state
-                )
-
+import sys; sys.exit(0)
