@@ -9,7 +9,7 @@ This repository is forked from the MotiFiesta algorithm repository described in 
 
 ## Architecture:
 
-![](discovery.pdf)
+[Architecture diagram](discovery.pdf)
 
 ## Setup
 
