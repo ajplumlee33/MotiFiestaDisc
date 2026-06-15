@@ -34,3 +34,5 @@ $ scripts/motifiesta train --mode disc --name barbell-disc --dataset synth-barbe
 ```
 $ python MotiFiesta/training/disc_decode.py --name barbell-disc --data synth-barbell-k10
 ```
+
+[1]: https://arxiv.org/abs/2206.01008
