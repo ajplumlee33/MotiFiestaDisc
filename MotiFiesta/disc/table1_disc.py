@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """table1 sweep for MotiFiestaDisc models.
 
 trains on d=0.00, evaluates on d=0.00/0.01/0.02/0.05.
@@ -12,8 +11,8 @@ import torch
 
 from MotiFiesta.utils.learning_utils import load_model, get_device
 from MotiFiesta.training.loading import get_loader
-from MotiFiesta.training.disc_model import MotiFiestaDisc
-from MotiFiesta.training.disc_decode import eval_config, _embed_all, _decode_from_cache, _eval
+from MotiFiesta.disc.disc_model import MotiFiestaDisc
+from MotiFiesta.disc.disc_decode import eval_config, _embed_all, _decode_from_cache, _eval
 
 MOTIFS = [
     ('barbell', 'barbell_walk'),

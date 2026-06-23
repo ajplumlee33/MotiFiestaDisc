@@ -88,8 +88,8 @@ if function == 'train':
     print(">>> building model")
 
     if args.mode == 'disc':
-        from MotiFiesta.training.disc_model import MotiFiestaDisc
-        from MotiFiesta.training.disc_train import disc_train
+        from MotiFiesta.disc.disc_model import MotiFiestaDisc
+        from MotiFiesta.disc.disc_train import disc_train
         import torch
         walk_lens = [int(x) for x in args.walk_lens.split(',')]
         disc_hparams = {
@@ -119,10 +119,11 @@ if function == 'train':
             optimizer = torch.optim.Adam(model.parameters())
             optimizer.load_state_dict(ckpt['optimizer_state_dict'])
             epoch_start = ckpt['epoch'] + 1
-            controller_state = ckpt['controller_state_dict']
+            best_loss = ckpt.get('best_loss', float('inf'))
+            controller_state = None
         else:
             model = MotiFiestaDisc(**disc_hparams)
-            epoch_start, optimizer, controller_state = 0, None, None
+            epoch_start, optimizer, best_loss, controller_state = 0, None, float('inf'), None
         print(model)
         print(">>> training...")
         disc_train(
@@ -137,8 +138,8 @@ if function == 'train':
             beta=args.beta,
             lam=args.lam,
             epoch_start=epoch_start,
+            best_loss=best_loss,
             optimizer=optimizer,
-            controller_state=controller_state,
         )
     else:
         hparams = {'model': {

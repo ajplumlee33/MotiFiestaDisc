@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """profile a MotiFiestaDisc forward pass, timing each section.
 
 mps ops are async — call synchronize() before every timer read so numbers
@@ -15,7 +14,7 @@ import torch
 
 from MotiFiesta.utils.learning_utils import get_device
 from MotiFiesta.training.loading import get_loader
-from MotiFiesta.training.disc_model import MotiFiestaDisc
+from MotiFiesta.disc.disc_model import MotiFiestaDisc
 
 
 def sync():

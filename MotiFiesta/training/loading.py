@@ -70,9 +70,9 @@ def get_loader(root,
         dataset = PrebuiltPairsDataset(root=root)
     elif not name.startswith('synth'):
         if name == 'IMDB-BINARY':
-            dataset = RealWorldDataset(root=root, max_degree=300, n_features=301)
+            dataset = RealWorldDataset(root=name, max_degree=300, n_features=301)
         else:
-            dataset = RealWorldDataset(root=root)
+            dataset = RealWorldDataset(root=name)
     else:
         dataset = SyntheticMotifs(root=root, name=name, **kwargs)
     lengths = [math.floor(len(dataset) * .8), math.ceil(len(dataset) * .2)]

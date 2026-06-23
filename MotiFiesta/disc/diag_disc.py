@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """diagnose disc model: score gap and embedding cos_sim per level.
 
 usage:
@@ -12,7 +11,7 @@ import torch.nn.functional as F
 
 from MotiFiesta.utils.learning_utils import get_device
 from MotiFiesta.training.loading import get_loader
-from MotiFiesta.training.disc_model import MotiFiestaDisc
+from MotiFiesta.disc.disc_model import MotiFiestaDisc
 
 
 def load_model(name, device):

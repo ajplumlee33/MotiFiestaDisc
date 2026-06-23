@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 evaluate a MotiFiestaDisc model with the table1 sweep:
   hash_dim in [8, 16, 32], level in [0, 1, 2], top_k=3, n_runs=3, n_graphs=200
@@ -184,7 +183,7 @@ def main():
     device = get_device()
 
     import json
-    from MotiFiesta.training.disc_model import MotiFiestaDisc
+    from MotiFiesta.disc.disc_model import MotiFiestaDisc
     ckpt = torch.load(f'models/{args.name}/{args.name}_best.pth', map_location='cpu',
                       weights_only=False)
     msd = ckpt['model_state_dict']
