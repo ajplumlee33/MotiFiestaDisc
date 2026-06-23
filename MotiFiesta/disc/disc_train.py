@@ -11,7 +11,6 @@ def disc_train(model,
                test_loader,
                model_name='default',
                epochs=10,
-               warmup_epochs=0,
                lam=1,
                beta=1,
                max_batches=-1,
@@ -29,11 +28,6 @@ def disc_train(model,
     model.to(device)
 
     for epoch in range(epoch_start, epochs):
-        # reset optimizer at warmup→freq_loss transition so warmup momentum doesn't fight new gradients
-        if epoch == warmup_epochs and warmup_epochs > 0:
-            optimizer = torch.optim.Adam(model.parameters())
-            best_loss = float('inf')
-
         model.train()
         num_batches = len(train_loader)
         train_loss = 0.0
@@ -53,16 +47,13 @@ def disc_train(model,
             t_fwd += time.time() - t
 
             t = time.time()
-            if epoch < warmup_epochs:
-                loss = model.rec_loss(internals_pos)
-            else:
-                batch_neg = batch['neg'].to(device)
-                with torch.no_grad():
-                    _, _, _, _, _, internals_neg = model(
-                        batch_neg.x, batch_neg.edge_index, batch_neg.batch
-                    )
-                loss = model.freq_loss(internals_pos, internals_neg, pp_pos,
-                                       beta=beta, lam=lam, k=n_neighbors)
+            batch_neg = batch['neg'].to(device)
+            with torch.no_grad():
+                _, _, _, _, _, internals_neg = model(
+                    batch_neg.x, batch_neg.edge_index, batch_neg.batch
+                )
+            loss = model.freq_loss(internals_pos, internals_neg, pp_pos,
+                                   beta=beta, lam=lam, k=n_neighbors)
             t_loss += time.time() - t
             train_loss += loss.item()
 
@@ -89,15 +80,12 @@ def disc_train(model,
                 _, pp_pos, _, _, _, internals_pos = model(
                     batch_pos.x, batch_pos.edge_index, batch_pos.batch
                 )
-                if epoch < warmup_epochs:
-                    test_loss += model.rec_loss(internals_pos).item()
-                else:
-                    batch_neg = batch['neg'].to(device)
-                    _, _, _, _, _, internals_neg = model(
-                        batch_neg.x, batch_neg.edge_index, batch_neg.batch
-                    )
-                    test_loss += model.freq_loss(internals_pos, internals_neg, pp_pos,
-                                                 beta=beta, lam=lam, k=n_neighbors).item()
+                batch_neg = batch['neg'].to(device)
+                _, _, _, _, _, internals_neg = model(
+                    batch_neg.x, batch_neg.edge_index, batch_neg.batch
+                )
+                test_loss += model.freq_loss(internals_pos, internals_neg, pp_pos,
+                                             beta=beta, lam=lam, k=n_neighbors).item()
             n_test_batches += 1
         test_loss /= max(n_test_batches, 1)
 

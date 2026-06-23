@@ -68,7 +68,6 @@ if function == 'train':
     parser.add_argument("--walk-lens", type=str, default="4,8,12", help="comma-separated snowball walk lengths per level (disc mode).")
     parser.add_argument("--n-walks", type=int, default=4, help="snowball walks per anchor node (disc mode).")
     parser.add_argument("--wl-hops", type=int, default=1, help="WL neighbor-sum hops for full-graph feature augmentation (disc mode).")
-    parser.add_argument("--warmup-epochs", type=int, default=5, help="epochs of rec_loss encoder warmup before freq_loss (disc mode).")
 
     args, _ = parser.parse_known_args()
     print(args)
@@ -108,7 +107,6 @@ if function == 'train':
             'k': args.k,
             'lam': args.lam,
             'beta': args.beta,
-            'warmup_epochs': args.warmup_epochs,
         }}
         dump_model_hparams(args.name, hparams)
         if args.restart:
@@ -133,7 +131,6 @@ if function == 'train':
             model_name=args.name,
             epochs=args.epochs,
             max_batches=args.max_batches,
-            warmup_epochs=args.warmup_epochs,
             n_neighbors=args.k,
             beta=args.beta,
             lam=args.lam,

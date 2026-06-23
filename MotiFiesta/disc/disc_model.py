@@ -47,9 +47,6 @@ class MotiFiestaDisc(torch.nn.Module):
             torch.nn.Linear(hidden_dim, 1) for _ in self.walk_lens
         ])
 
-        # decoder for warmup: reconstruct mean degree distribution from z_sub
-        self.x_decoder = torch.nn.Linear(hidden_dim, n_features)
-
     def _wl_augment(self, x, edge_index):
         """k-hop WL neighbor sum augmentation on the full graph."""
         src, dst = edge_index[0], edge_index[1]
@@ -103,7 +100,7 @@ class MotiFiestaDisc(torch.nn.Module):
         """induced subgraph GIN: build batched graph → anchor flag → GIN → mean pool."""
         if not subgraph_list:
             emp = torch.zeros(0, dtype=torch.long, device=device)
-            return torch.zeros(0, self.hidden_dim, device=device), emp, emp, torch.zeros(0, self.n_features)
+            return torch.zeros(0, self.hidden_dim, device=device), emp, emp
 
         n_sub = len(subgraph_list)
         x_aug_cpu = x_aug.detach().cpu()
@@ -168,11 +165,7 @@ class MotiFiestaDisc(torch.nn.Module):
         sub_t = torch.tensor(sub_assign, dtype=torch.long, device=device)
         z_sub = scatter(H, sub_t, dim=0, dim_size=n_sub, reduce='mean')
 
-        # mean of original x features as reconstruction target for warmup
-        x_orig = X_wl[:, :self.n_features]
-        x_target = scatter(x_orig, sub_t.cpu(), dim=0, dim_size=n_sub, reduce='mean')
-
-        return z_sub, nodes_t.to(device), sub_t, x_target
+        return z_sub, nodes_t.to(device), sub_t
 
     def forward(self, x, edge_index, _batch, **_):
         n = x.size(0)
@@ -190,7 +183,7 @@ class MotiFiestaDisc(torch.nn.Module):
             sub_batch = torch.tensor(
                 [g for _, _, g in subgraph_list], dtype=torch.long, device=device
             ) if subgraph_list else torch.zeros(0, dtype=torch.long, device=device)
-            z_sub, flat_nodes, flat_subs, x_target = self._embed_subgraphs(
+            z_sub, flat_nodes, flat_subs = self._embed_subgraphs(
                 x_aug, adj, subgraph_list, device
             )
             scores = torch.sigmoid(self.score_nets[lvl](z_sub).squeeze(-1))
@@ -209,21 +202,10 @@ class MotiFiestaDisc(torch.nn.Module):
                 'scores':      scores,
                 'node_to_sub': node_to_sub,
                 'sub_batch':   sub_batch,
-                'x_target':    x_target,
             })
 
         merge_info = {'node_to_sub': all_mh}
         return all_z, all_scores, all_ei, None, merge_info, all_internals
-
-    def rec_loss(self, internals_pos):
-        """warmup loss: reconstruct anchor-weighted mean degree from z_sub."""
-        device = next(self.parameters()).device
-        total = torch.zeros(1, device=device).squeeze()
-        for internal in internals_pos:
-            z = internal['z_sub']
-            tgt = internal['x_target'].to(device)
-            total = total + torch.nn.functional.mse_loss(self.x_decoder(z), tgt)
-        return total / max(len(internals_pos), 1)
 
     def freq_loss(self, internals_pos, internals_neg, pp, beta=1, lam=1.0, k=30):
         """kNN density contrast. GIN and score_nets train jointly via score gradient."""
