@@ -85,7 +85,7 @@ class RealWorldDataset(Dataset):
         self.max_degree = max_degree
         self.n_features = n_features
 
-        super(RealWorldDataset, self).__init__("data/"+root, transform)
+        super(RealWorldDataset, self).__init__("data/"+root+"_pairs", transform)
 
     @property
     def processed_file_names(self):

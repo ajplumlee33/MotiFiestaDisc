@@ -8,7 +8,10 @@ device_cache = None
 def get_device():
     global device_cache
     if device_cache is None:
-        if torch.cuda.is_available():
+        override = os.environ.get("MOTIFIESTA_DEVICE", "").strip()
+        if override:
+            device_cache = torch.device(override)
+        elif torch.cuda.is_available():
             device_cache = torch.device("cuda")
         elif torch.backends.mps.is_available():
             device_cache = torch.device("mps")
