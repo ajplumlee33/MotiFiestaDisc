@@ -18,19 +18,18 @@ def load_model(name, device):
     ckpt = torch.load(f'models/{name}/{name}_best.pth', map_location='cpu', weights_only=False)
     with open(f'models/{name}/hparams.json') as f:
         hp = json.load(f)['model']
-    wl_raw = hp.get('walk_lens', hp.get('walk_len', 8))
+    wl_raw = hp.get('walk_lens', [1, 2, 3])
     walk_lens = [int(x) for x in wl_raw.split(',')] if isinstance(wl_raw, str) else (
         wl_raw if isinstance(wl_raw, list) else [wl_raw])
     model = MotiFiestaDisc(
         n_features=hp['n_features'],
-        rwse_steps=hp.get('rwse_steps', 8),
+        hidden_dim=hp.get('hidden_dim', 32),
+        gin_layers=hp.get('gin_layers', 2),
         walk_lens=walk_lens,
-        n_walks=hp.get('n_walks', 4),
         wl_hops=hp.get('wl_hops', 1),
-        pair_sampling=hp.get('pair_sampling', False),
-        rwr_alpha=hp.get('rwr_alpha', 0.0),
+        pool=hp.get('pool', 'mean'),
     )
-    model.load_state_dict(ckpt['model_state_dict'])
+    model.load_state_dict(ckpt['model_state_dict'], strict=False)
     model.to(device).eval()
     return model
 
@@ -59,15 +58,13 @@ def main():
             g = g_pair['pos']
             n = len(g.x)
             batch = torch.zeros(n, dtype=torch.long, device=device)
-            embs, probas, _, _, merge_info, internals = model(
-                g.x.float().to(device), g.edge_index.to(device), batch
-            )
+            levels = model(g.x.float().to(device), g.edge_index.to(device), batch)
             motif_id = g.motif_id.to(device)   # (n_nodes,) 0/1
 
             for lvl in range(len(model.walk_lens)):
-                z   = internals[lvl]['z_sub']          # (n_sub, z_dim)
-                s   = internals[lvl]['scores']         # (n_sub,)
-                mh  = internals[lvl]['node_to_sub']    # (n_nodes,) node→sub index
+                z   = levels[lvl]['z_sub']          # (n_sub, z_dim)
+                s   = levels[lvl]['scores']         # (n_sub,)
+                mh  = levels[lvl]['node_to_sub']    # (n_nodes,) node→sub index
 
                 # label each subgraph: majority motif_id among its member nodes
                 n_sub = z.size(0)
@@ -117,13 +114,12 @@ def main():
         print(f'{lvl:>4}  {wl:>4}  {s_mot:>8.3f}  {s_bg:>8.3f}  {gap:>8.3f}'
               f'  {cos_mm:>8.4f}  {cos_bb:>8.4f}  {cos_mb:>8.4f}  {n_mot:>6}  {n_bg:>6}')
 
-    # score_net weights for level 2 (most informative)
     print('\n--- score_net weights (level 2) ---')
     w = model.score_nets[-1].weight.data.squeeze()
     top_pos = w.topk(6).indices.tolist()
     top_neg = (-w).topk(6).indices.tolist()
-    print(f'  + bins (x[i] if i<{model.n_features}, else nbr_sum[i-{model.n_features}]): {top_pos}')
-    print(f'  - bins: {top_neg}')
+    print(f'  + dims: {top_pos}')
+    print(f'  - dims: {top_neg}')
 
 
 if __name__ == '__main__':

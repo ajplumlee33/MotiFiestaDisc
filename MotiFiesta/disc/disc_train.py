@@ -11,14 +11,18 @@ def disc_train(model,
                test_loader,
                model_name='default',
                epochs=10,
-               lam=1,
-               beta=1,
+               lam=1.0,
+               beta=1.0,
                max_batches=-1,
                n_neighbors=30,
                grad_clip=1.0,
                epoch_start=0,
                best_loss=float('inf'),
                optimizer=None,
+               warmup=0,
+               freq_lr=1e-3,
+               tau=0.1,
+               lr_patience=0,
                **_,
                ):
     device = get_device()
@@ -26,8 +30,25 @@ def disc_train(model,
     if optimizer is None:
         optimizer = torch.optim.Adam(model.parameters())
     model.to(device)
+    # move optimizer state tensors to device (needed when restarting from cpu checkpoint)
+    for state in optimizer.state.values():
+        for k, v in state.items():
+            if isinstance(v, torch.Tensor):
+                state[k] = v.to(device)
+
+    freq_epochs = epochs - warmup
+    scheduler = None
 
     for epoch in range(epoch_start, epochs):
+        # at the warmup→freq_loss boundary: reset optimizer and scheduler, reset best_loss
+        if epoch == warmup and warmup > 0:
+            optimizer = torch.optim.Adam(model.parameters(), lr=freq_lr)
+            scheduler = (torch.optim.lr_scheduler.ReduceLROnPlateau(
+                optimizer, mode='min', factor=0.5, patience=lr_patience, min_lr=1e-6)
+                if lr_patience > 0 else None)
+            best_loss = float('inf')
+
+        is_warmup = epoch < warmup
         model.train()
         num_batches = len(train_loader)
         train_loss = 0.0
@@ -38,22 +59,22 @@ def disc_train(model,
                 break
 
             optimizer.zero_grad()
-            batch_pos = batch['pos'].to(device)
 
             t = time.time()
-            _, pp_pos, _, _, _, internals_pos = model(
-                batch_pos.x, batch_pos.edge_index, batch_pos.batch
-            )
+            batch_pos = batch['pos'].to(device)
+            levels_pos = model(batch_pos.x, batch_pos.edge_index, batch_pos.batch)
             t_fwd += time.time() - t
 
             t = time.time()
-            batch_neg = batch['neg'].to(device)
-            with torch.no_grad():
-                _, _, _, _, _, internals_neg = model(
-                    batch_neg.x, batch_neg.edge_index, batch_neg.batch
-                )
-            loss = model.freq_loss(internals_pos, internals_neg, pp_pos,
-                                   beta=beta, lam=lam, k=n_neighbors)
+            if is_warmup:
+                loss = model.rec_loss(levels_pos)
+                del batch_pos, levels_pos
+            else:
+                batch_neg = batch['neg'].to(device)
+                with torch.no_grad():
+                    levels_neg = model(batch_neg.x, batch_neg.edge_index, batch_neg.batch)
+                loss = model.freq_loss(levels_pos, levels_neg, beta=beta, lam=lam, k=n_neighbors)
+                del batch_pos, batch_neg, levels_pos, levels_neg
             t_loss += time.time() - t
             train_loss += loss.item()
 
@@ -62,9 +83,11 @@ def disc_train(model,
             if grad_clip is not None:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
             optimizer.step()
+            del loss
             t_bwd += time.time() - t
 
-            del batch_pos, internals_pos, pp_pos, loss
+        if scheduler is not None and not is_warmup:
+            scheduler.step(test_loss)
 
         n_train = min(max_batches, num_batches) if max_batches > 0 else num_batches
         train_loss /= n_train
@@ -75,17 +98,19 @@ def disc_train(model,
         for batch_idx, batch in tqdm(enumerate(test_loader), total=len(test_loader)):
             if max_batches > 0 and batch_idx >= max_batches:
                 break
-            batch_pos = batch['pos'].to(device)
             with torch.no_grad():
-                _, pp_pos, _, _, _, internals_pos = model(
-                    batch_pos.x, batch_pos.edge_index, batch_pos.batch
-                )
-                batch_neg = batch['neg'].to(device)
-                _, _, _, _, _, internals_neg = model(
-                    batch_neg.x, batch_neg.edge_index, batch_neg.batch
-                )
-                test_loss += model.freq_loss(internals_pos, internals_neg, pp_pos,
-                                             beta=beta, lam=lam, k=n_neighbors).item()
+                batch_pos = batch['pos'].to(device)
+                levels_pos = model(batch_pos.x, batch_pos.edge_index, batch_pos.batch)
+                if is_warmup:
+                    test_loss += model.rec_loss(levels_pos).item()
+                    del batch_pos, levels_pos
+                else:
+                    batch_neg = batch['neg'].to(device)
+                    levels_neg = model(batch_neg.x, batch_neg.edge_index, batch_neg.batch)
+                    test_loss += model.freq_loss(
+                        levels_pos, levels_neg, beta=beta, lam=lam, k=n_neighbors
+                    ).item()
+                    del batch_pos, batch_neg, levels_pos, levels_neg
             n_test_batches += 1
         test_loss /= max(n_test_batches, 1)
 
@@ -105,7 +130,9 @@ def disc_train(model,
         if hasattr(torch, 'mps') and torch.backends.mps.is_available():
             torch.mps.empty_cache()
 
+        phase = 'warmup' if is_warmup else 'freq'
         elapsed = time.time() - start_time
-        print(f"epoch {epoch+1}/{epochs}  train: {train_loss:.4f}  test: {test_loss:.4f}"
-              f"  fwd: {t_fwd:.1f}s  loss: {t_loss:.1f}s  bwd: {t_bwd:.1f}s"
+        lr = optimizer.param_groups[0]['lr']
+        print(f"epoch {epoch+1}/{epochs} [{phase}]  train: {train_loss:.4f}  test: {test_loss:.4f}"
+              f"  lr: {lr:.2e}  fwd: {t_fwd:.1f}s  loss: {t_loss:.1f}s  bwd: {t_bwd:.1f}s"
               f"  elapsed: {elapsed:.1f}s")

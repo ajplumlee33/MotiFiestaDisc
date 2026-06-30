@@ -1,10 +1,8 @@
 #!/usr/bin/env python
 
 import sys
-import pickle
 import argparse
 
-import numpy as np
 import warnings
 warnings.simplefilter("ignore", UserWarning)
 
@@ -13,7 +11,6 @@ from MotiFiesta.training.loading import get_loader
 from MotiFiesta.training.train import motif_train
 from MotiFiesta.utils.learning_utils import dump_model_hparams
 from MotiFiesta.utils.learning_utils import load_model
-from MotiFiesta.utils.learning_utils import load_data
 from MotiFiesta.utils.learning_utils import make_dirs
 from MotiFiesta.utils.learning_utils import get_device
 
@@ -28,46 +25,58 @@ except IndexError:
 
 print(f"== {function} mode ==")
 
-# train the motif pooling model
 if function == 'train':
     parser = argparse.ArgumentParser()
     parser.add_argument("--name", "-n", type=str, default="default")
-    parser.add_argument("--mode", type=str, default="default", choices=["default", "disc"],
-                        help="default: MotiFiestaModel + motif_train. disc: MotiFiestaDisc + disc_train.")
+    parser.add_argument("--mode", type=str, default="default", choices=["default", "disc"])
     parser.add_argument("--dataset", "-da", type=str, default='synthetic')
     parser.add_argument("--data_root", type=str, default='.')
-    parser.add_argument("--restart", "-r", action='store_true', default=False,  help='Restart model.')
+    parser.add_argument("--restart", "-r", action='store_true', default=False)
 
-    # training  loop
+    # training loop
     parser.add_argument("--batch-size", "-b", type=int, default=16)
     parser.add_argument("--max-batches", "-m", type=int, default=-1)
-    parser.add_argument("--epochs", "-e", type=int, default=40)
-    parser.add_argument("--stop-epochs", type=int, default=30, help="Number of epochs to train embeddings before doing motifs.")
-    parser.add_argument("--attributed", default=False, action='store_true', help="Use attributed graphs. If False, use node degree as features.")
+    parser.add_argument("--epochs", "-e", type=int, default=25)
+    parser.add_argument("--stop-epochs", type=int, default=30)
+    parser.add_argument("--attributed", default=False, action='store_true')
 
     # learning
     parser.add_argument("--lam",  type=float, default=1)
     parser.add_argument("--beta", type=float, default=1)
-    parser.add_argument("--estimator", "-es", type=str, default='knn', help="Which density estimator to use for the motif agg. step")
-    parser.add_argument("--n-neighbors", "-nn", type=int, default=30, help="Number of neighbors")
-    parser.add_argument("--volume", "-vv", action='store_true', default=False, help="Use d-sphere volume to normalize density with kNN.")
+    parser.add_argument("--estimator", "-es", type=str, default='knn')
+    parser.add_argument("--n-neighbors", "-nn", type=int, default=30)
+    parser.add_argument("--volume", "-vv", action='store_true', default=False)
 
-    # model architecture
+    # default-mode architecture
     parser.add_argument("--steps", "-s", type=int, default=5)
     parser.add_argument("--dim", "-d", type=int, default=8)
     parser.add_argument("--pool-dummy", action="store_true", default=False)
-    parser.add_argument("--score-method", default="sigmoid", help="Edge soring method: (sigmoid, softmax-neighbors, softmax-all)")
-    parser.add_argument("--merge-method", default="sum", help="Edge merge method: (sum, cat, set2set)")
-    parser.add_argument("--hard-embed", action='store_true', help="Whether to use hard embedding using degree histogram. ")
+    parser.add_argument("--score-method", default="sigmoid")
+    parser.add_argument("--merge-method", default="sum")
+    parser.add_argument("--hard-embed", action='store_true')
 
-    # disc-mode args (ignored in default mode)
-    parser.add_argument("--hidden-dim", type=int, default=32, help="GIN hidden dimension (disc mode).")
-    parser.add_argument("--gin-layers", type=int, default=2, help="GIN depth per induced subgraph (disc mode).")
-    parser.add_argument("--k", type=int, default=30, help="kNN neighbors for freq_loss (disc mode).")
-    parser.add_argument("--rwse-steps", type=int, default=8, help="RWSE walk length (disc mode).")
-    parser.add_argument("--walk-lens", type=str, default="4,8,12", help="comma-separated snowball walk lengths per level (disc mode).")
-    parser.add_argument("--n-walks", type=int, default=4, help="snowball walks per anchor node (disc mode).")
-    parser.add_argument("--wl-hops", type=int, default=1, help="WL neighbor-sum hops for full-graph feature augmentation (disc mode).")
+    # disc-mode args
+    parser.add_argument("--hidden-dim", type=int, default=32,
+                        help="gin hidden dimension (disc mode).")
+    parser.add_argument("--gin-layers", type=int, default=2,
+                        help="gin depth per induced subgraph (disc mode).")
+    parser.add_argument("--k", type=int, default=30,
+                        help="knn neighbors for freq_loss (disc mode).")
+    parser.add_argument("--walk-lens", type=str, default="1,2,3",
+                        help="comma-separated ego-net hop radii, one per level (disc mode).")
+    parser.add_argument("--wl-hops", type=int, default=1,
+                        help="wl neighbor-sum hops for full-graph feature augmentation (disc mode).")
+    parser.add_argument("--warmup", type=int, default=0,
+                        help="epochs of rec_loss warmup before switching to freq_loss (disc mode).")
+    parser.add_argument("--freq-lr", type=float, default=1e-3,
+                        help="initial lr for freq_loss phase after warmup (disc mode).")
+    parser.add_argument("--sigma", type=float, default=0.5,
+                        help="gaussian kde bandwidth for freq_loss (disc mode).")
+    parser.add_argument("--pool", type=str, default="mean", choices=["mean", "anchor", "attn"],
+                        help="subgraph pooling: mean, anchor-only, or attention-weighted (disc mode).")
+    parser.add_argument("--tau", type=float, default=0.1)
+    parser.add_argument("--lr-patience", type=int, default=0,
+                        help="ReduceLROnPlateau patience for freq phase (0 = disabled).")
 
     args, _ = parser.parse_known_args()
     print(args)
@@ -76,11 +85,11 @@ if function == 'train':
 
     print(">>> loading data")
     data = get_loader(
-                      name=args.dataset,
-                      root=args.data_root,
-                      batch_size=args.batch_size,
-                      attributed=args.attributed if hasattr(args, 'attributed') else False,
-                      )
+        name=args.dataset,
+        root=args.data_root,
+        batch_size=args.batch_size,
+        attributed=args.attributed if hasattr(args, 'attributed') else False,
+    )
     n_features = data['dataset_whole'].num_features
     print(n_features)
 
@@ -95,33 +104,37 @@ if function == 'train':
             'model_type': 'disc',
             'hidden_dim': args.hidden_dim,
             'gin_layers': args.gin_layers,
-            'rwse_steps': args.rwse_steps,
-            'walk_lens': walk_lens,
-            'n_walks': args.n_walks,
-            'wl_hops': args.wl_hops,
+            'walk_lens':  walk_lens,
+            'wl_hops':    args.wl_hops,
             'n_features': n_features,
+            'pool':       args.pool,
         }
         hparams = {'model': disc_hparams, 'train': {
-            'epochs': args.epochs,
+            'epochs':     args.epochs,
             'batch_size': args.batch_size,
-            'k': args.k,
-            'lam': args.lam,
-            'beta': args.beta,
+            'k':          args.k,
+            'lam':        args.lam,
+            'beta':       args.beta,
         }}
         dump_model_hparams(args.name, hparams)
         if args.restart:
-            print(f"Restarting training with ID: {args.name}")
-            ckpt = torch.load(f'models/{args.name}/{args.name}.pth', map_location='cpu')
+            print(f"restarting training with id: {args.name}")
+            ckpt = torch.load(f'models/{args.name}/{args.name}.pth', map_location='cpu',
+                              weights_only=False)
             model = MotiFiestaDisc(**disc_hparams)
             model.load_state_dict(ckpt['model_state_dict'])
-            optimizer = torch.optim.Adam(model.parameters())
-            optimizer.load_state_dict(ckpt['optimizer_state_dict'])
             epoch_start = ckpt['epoch'] + 1
             best_loss = ckpt.get('best_loss', float('inf'))
-            controller_state = None
+            # if restarting past the warmup boundary, use freq_lr for a fresh optimizer
+            # rather than loading saved momentum which may cause bouncing
+            if epoch_start > args.warmup and args.freq_lr != 1e-3:
+                optimizer = torch.optim.Adam(model.parameters(), lr=args.freq_lr)
+            else:
+                optimizer = torch.optim.Adam(model.parameters())
+                optimizer.load_state_dict(ckpt['optimizer_state_dict'])
         else:
             model = MotiFiestaDisc(**disc_hparams)
-            epoch_start, optimizer, best_loss, controller_state = 0, None, float('inf'), None
+            epoch_start, optimizer, best_loss = 0, None, float('inf')
         print(model)
         print(">>> training...")
         disc_train(
@@ -137,6 +150,11 @@ if function == 'train':
             epoch_start=epoch_start,
             best_loss=best_loss,
             optimizer=optimizer,
+            warmup=args.warmup,
+            freq_lr=args.freq_lr,
+            sigma=args.sigma,
+            tau=args.tau,
+            lr_patience=args.lr_patience,
         )
     else:
         hparams = {'model': {
@@ -153,7 +171,7 @@ if function == 'train':
         }}
         dump_model_hparams(args.name, hparams)
         if args.restart:
-            print(f"Restarting training with ID: {args.name}")
+            print(f"restarting training with id: {args.name}")
             model_dict = load_model(args.name)
             model = model_dict['model']
             epoch_start = model_dict['epoch']
@@ -179,7 +197,6 @@ if function == 'train':
                     lam=args.lam,
                     epoch_start=epoch_start,
                     optimizer=optimizer,
-                    controller_state=controller_state
-                    )
+                    controller_state=controller_state)
 
 import sys; sys.exit(0)
