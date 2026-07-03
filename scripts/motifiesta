@@ -56,16 +56,20 @@ if function == 'train':
     parser.add_argument("--hard-embed", action='store_true')
 
     # disc-mode args
-    parser.add_argument("--hidden-dim", type=int, default=32,
+    parser.add_argument("--hidden-dim", type=int, default=64,
                         help="gin hidden dimension (disc mode).")
     parser.add_argument("--gin-layers", type=int, default=2,
                         help="gin depth per induced subgraph (disc mode).")
     parser.add_argument("--k", type=int, default=30,
                         help="knn neighbors for freq_loss (disc mode).")
-    parser.add_argument("--walk-lens", type=str, default="1,2,3",
-                        help="comma-separated ego-net hop radii, one per level (disc mode).")
-    parser.add_argument("--wl-hops", type=int, default=1,
+    parser.add_argument("--k-max", type=int, default=12,
+                        help="maximum induced subgraph size (disc mode).")
+    parser.add_argument("--n-samples", type=int, default=50,
+                        help="random induced subgraphs sampled per graph per forward pass (disc mode).")
+    parser.add_argument("--wl-hops", type=int, default=0,
                         help="wl neighbor-sum hops for full-graph feature augmentation (disc mode).")
+    parser.add_argument("--max-knn-size", type=int, default=-1,
+                        help="cap on kdtree reference set size in freq_loss (-1 = no cap).")
     parser.add_argument("--warmup", type=int, default=0,
                         help="epochs of rec_loss warmup before switching to freq_loss (disc mode).")
     parser.add_argument("--freq-lr", type=float, default=1e-3,
@@ -77,6 +81,27 @@ if function == 'train':
     parser.add_argument("--tau", type=float, default=0.1)
     parser.add_argument("--lr-patience", type=int, default=0,
                         help="ReduceLROnPlateau patience for freq phase (0 = disabled).")
+    parser.add_argument("--freeze-gin", action='store_true', default=False,
+                        help="freeze gin after warmup; freq phase trains score_net only via freq_loss.")
+    parser.add_argument("--warmup-loss", type=str, default='ae',
+                        choices=['ae', 'rec', 'wwl', 'ae+wwl', 'infonce', 'walk_pair'],
+                        help="warmup loss: 'ae' = link prediction bce, 'rec' = shell mse, 'wwl' = wwl kernel mse, 'ae+wwl' = both, 'infonce' = nt-xent with wl hash labels.")
+    parser.add_argument("--dist-label", action='store_true', default=False,
+                        help="append one-hot bfs distance from seed (5 bins) to gin node features.")
+    parser.add_argument("--infonce-tau", type=float, default=0.1,
+                        help="temperature for infonce/nt-xent warmup loss.")
+    parser.add_argument("--ae-freq", action='store_true', default=False,
+                        help="freq phase: mix in 0.1 * ae_loss alongside freq_loss (default: freq_loss only).")
+    parser.add_argument("--ae-eps", type=float, default=0.0,
+                        help="label smoothing for ae_loss adjacency targets (0=off, 0.1-0.15 recommended).")
+    parser.add_argument("--wwl-freq", action='store_true', default=False,
+                        help="add wwl_loss to freq phase loss (alongside ae+freq) to maintain pairwise metric.")
+    parser.add_argument("--score-weight", action='store_true', default=False,
+                        help="weight knn density by neighbor scores (s_ref) — only valid with --estimator knn.")
+    parser.add_argument("--anneal-epochs", type=int, default=0,
+                        help="if >0, replace hard warmup with joint annealing: ae weight 1→ae-min-weight, freq weight 0→1 over this many epochs.")
+    parser.add_argument("--ae-min-weight", type=float, default=0.1,
+                        help="minimum ae loss weight at end of annealing schedule.")
 
     args, _ = parser.parse_known_args()
     print(args)
@@ -99,15 +124,16 @@ if function == 'train':
         from MotiFiesta.disc.disc_model import MotiFiestaDisc
         from MotiFiesta.disc.disc_train import disc_train
         import torch
-        walk_lens = [int(x) for x in args.walk_lens.split(',')]
         disc_hparams = {
-            'model_type': 'disc',
-            'hidden_dim': args.hidden_dim,
-            'gin_layers': args.gin_layers,
-            'walk_lens':  walk_lens,
-            'wl_hops':    args.wl_hops,
-            'n_features': n_features,
-            'pool':       args.pool,
+            'model_type':  'disc',
+            'hidden_dim':  args.hidden_dim,
+            'gin_layers':  args.gin_layers,
+            'k_max':       args.k_max,
+            'n_samples':   args.n_samples,
+            'wl_hops':     args.wl_hops,
+            'n_features':  n_features,
+            'pool':        args.pool,
+            'dist_label':  args.dist_label,
         }
         hparams = {'model': disc_hparams, 'train': {
             'epochs':     args.epochs,
@@ -132,9 +158,10 @@ if function == 'train':
             else:
                 optimizer = torch.optim.Adam(model.parameters())
                 optimizer.load_state_dict(ckpt['optimizer_state_dict'])
+            scheduler_state = ckpt.get('scheduler_state_dict')
         else:
             model = MotiFiestaDisc(**disc_hparams)
-            epoch_start, optimizer, best_loss = 0, None, float('inf')
+            epoch_start, optimizer, best_loss, scheduler_state = 0, None, float('inf'), None
         print(model)
         print(">>> training...")
         disc_train(
@@ -155,6 +182,17 @@ if function == 'train':
             sigma=args.sigma,
             tau=args.tau,
             lr_patience=args.lr_patience,
+            max_knn_size=args.max_knn_size,
+            freeze_gin=args.freeze_gin,
+            warmup_loss=args.warmup_loss,
+            ae_freq=args.ae_freq,
+            ae_eps=args.ae_eps,
+            wwl_freq=args.wwl_freq,
+            score_weight=args.score_weight,
+            scheduler_state=scheduler_state,
+            anneal_epochs=args.anneal_epochs,
+            ae_min_weight=args.ae_min_weight,
+            infonce_tau=args.infonce_tau,
         )
     else:
         hparams = {'model': {

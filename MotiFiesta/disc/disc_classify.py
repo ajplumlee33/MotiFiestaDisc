@@ -34,17 +34,28 @@ def load_disc(name):
                       map_location='cpu', weights_only=False)
     with open(f'models/{name}/hparams.json') as f:
         hp = json.load(f)['model']
-    wl_raw = hp.get('walk_lens', [1, 2, 3])
-    walk_lens = [int(x) for x in wl_raw.split(',')] if isinstance(wl_raw, str) else (
-        wl_raw if isinstance(wl_raw, list) else [wl_raw])
-    disc = MotiFiestaDisc(
-        n_features = hp['n_features'],
-        hidden_dim = hp.get('hidden_dim', 32),
-        gin_layers = hp.get('gin_layers', 2),
-        walk_lens  = walk_lens,
-        wl_hops    = hp.get('wl_hops', 1),
-        pool       = hp.get('pool', 'mean'),
-    )
+    if 'k_max' in hp:
+        disc = MotiFiestaDisc(
+            n_features = hp['n_features'],
+            hidden_dim = hp.get('hidden_dim', 64),
+            gin_layers = hp.get('gin_layers', 2),
+            wl_hops    = hp.get('wl_hops', 1),
+            k_max      = hp.get('k_max', 12),
+            n_samples  = hp.get('n_samples', 50),
+            pool       = hp.get('pool', 'mean'),
+        )
+    else:
+        wl_raw = hp.get('walk_lens', [1, 2, 3])
+        walk_lens = [int(x) for x in wl_raw.split(',')] if isinstance(wl_raw, str) else (
+            wl_raw if isinstance(wl_raw, list) else [wl_raw])
+        disc = MotiFiestaDisc(
+            n_features = hp['n_features'],
+            hidden_dim = hp.get('hidden_dim', 32),
+            gin_layers = hp.get('gin_layers', 2),
+            walk_lens  = walk_lens,
+            wl_hops    = hp.get('wl_hops', 1),
+            pool       = hp.get('pool', 'mean'),
+        )
     disc.load_state_dict(ckpt['model_state_dict'], strict=False)
     for p in disc.parameters():
         p.requires_grad = False
@@ -90,7 +101,7 @@ def main():
     fold_accs = []
 
     for fold, (train_idx, test_idx) in enumerate(cv.split(range(len(dataset)), labels)):
-        clf = RandomForestClassifier()
+        clf = RandomForestClassifier(n_estimators=args.n_estimators)
         clf.fit(embs[train_idx], ys[train_idx])
         pred   = clf.predict(embs[test_idx]).reshape(-1, 1)
         y_np   = ys[test_idx].reshape(-1, 1)
