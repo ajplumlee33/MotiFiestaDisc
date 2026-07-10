@@ -1,7 +1,7 @@
-"""diagnose disc model: score gap and embedding cos_sim.
+"""diagnose disc model: embedding cosine similarity by motif/bg label.
 
 usage:
-    python MotiFiesta/disc/diag_disc.py --name barbell_seal1 --data data/synth-barbell-k10
+    python MotiFiesta/disc/diag_disc.py --name barbell_wwl2 --data data/synth-barbell-k10
 """
 import argparse
 import json
@@ -22,10 +22,9 @@ def load_model(name, device):
         n_features = hp['n_features'],
         hidden_dim = hp.get('hidden_dim', 64),
         gin_layers = hp.get('gin_layers', 2),
+        gnn_type   = hp.get('gnn_type', 'gin'),
         k_max      = hp.get('k_max', 12),
         n_samples  = hp.get('n_samples', 50),
-        wl_hops    = hp.get('wl_hops', 1),
-        pool       = hp.get('pool', 'mean'),
     )
     model.load_state_dict(ckpt['model_state_dict'], strict=False)
     model.to(device).eval()
@@ -43,7 +42,7 @@ def main():
     model  = load_model(args.name, device)
     dataset = get_loader(root=args.data, name='synth_pairs')
 
-    all_z, all_s, all_lab = [], [], []
+    all_z, all_lab, all_k = [], [], []
 
     with torch.no_grad():
         for idx, g_pair in enumerate(dataset['dataset_whole']):
@@ -53,16 +52,14 @@ def main():
             n        = len(g.x)
             batch    = torch.zeros(n, dtype=torch.long, device=device)
             levels   = model(g.x.float().to(device), g.edge_index.to(device), batch)
-            motif_id = g.motif_id.to(device)   # (n_nodes,) 0/1
+            motif_id = g.motif_id.to(device)
 
             lvl        = levels[0]
-            z          = lvl['z_sub']           # (n_sub, hidden_dim)
-            s          = lvl['scores']          # (n_sub,)
-            flat_nodes = lvl['flat_nodes']      # (total_flat,)
-            flat_subs  = lvl['flat_subs']       # (total_flat,)
+            z          = lvl['z_sub']
+            flat_nodes = lvl['flat_nodes']
+            flat_subs  = lvl['flat_subs']
             n_sub      = z.size(0)
 
-            # label each subgraph by majority motif_id of its actual member nodes
             sub_motif = torch.zeros(n_sub, device=device)
             sub_count = torch.zeros(n_sub, device=device)
             sub_motif.scatter_add_(0, flat_subs, motif_id[flat_nodes].float())
@@ -70,23 +67,18 @@ def main():
             sub_label = (sub_motif / sub_count.clamp(min=1) > 0.5).long()
 
             all_z.append(z.cpu())
-            all_s.append(s.cpu())
             all_lab.append(sub_label.cpu())
+            all_k.append(lvl['k_sizes'].cpu())
 
     Z   = torch.cat(all_z,   dim=0)
-    S   = torch.cat(all_s,   dim=0)
     lab = torch.cat(all_lab, dim=0)
+    K   = torch.cat(all_k,   dim=0)
 
     mot_mask = lab == 1
     bg_mask  = lab == 0
     n_mot = mot_mask.sum().item()
     n_bg  = bg_mask.sum().item()
 
-    s_mot = S[mot_mask].mean().item() if n_mot > 0 else float('nan')
-    s_bg  = S[bg_mask].mean().item()  if n_bg  > 0 else float('nan')
-    gap   = s_mot - s_bg
-
-    # cosine similarity within and across clusters (sampled to avoid oom)
     def sample(mask, k=500):
         idx = mask.nonzero(as_tuple=False).squeeze(-1)
         if idx.size(0) > k:
@@ -100,21 +92,11 @@ def main():
     cos_bb = (Zb @ Zb.T).fill_diagonal_(float('nan')).nanmean().item() if Zb.size(0) > 1 else float('nan')
     cos_mb = (Zm @ Zb.T).mean().item() if (Zm.size(0) > 0 and Zb.size(0) > 0) else float('nan')
 
-    # score distribution
-    s_mot_std = S[mot_mask].std().item() if n_mot > 1 else float('nan')
-    s_bg_std  = S[bg_mask].std().item()  if n_bg  > 1 else float('nan')
-
-    # z_sub norms
     z_mot_norm = Z[mot_mask].norm(dim=-1).mean().item() if n_mot > 0 else float('nan')
     z_bg_norm  = Z[bg_mask].norm(dim=-1).mean().item()  if n_bg  > 0 else float('nan')
 
     print(f'\n=== {args.name} (n_graphs={args.n_graphs}) ===\n')
     print(f'subgraphs:  motif={n_mot}  bg={n_bg}  ratio={n_mot/(n_mot+n_bg):.3f}')
-    print()
-    print(f'scores:')
-    print(f'  motif  {s_mot:.4f} ±{s_mot_std:.4f}')
-    print(f'  bg     {s_bg:.4f} ±{s_bg_std:.4f}')
-    print(f'  gap    {gap:.4f}')
     print()
     print(f'z_sub norms (raw):')
     print(f'  motif  {z_mot_norm:.4f}')
@@ -125,18 +107,24 @@ def main():
     print(f'  bg-bg        {cos_bb:.4f}')
     print(f'  motif-bg     {cos_mb:.4f}  (0.0 = fully separated)')
     print()
-    print(f'score_net weight norms by dim (s/m/l):')
-    for name, snet in [('s', model.score_net_s), ('m', model.score_net_m), ('l', model.score_net_l)]:
-        # mlp: extract final linear layer; linear: use directly
-        final = snet[-1] if isinstance(snet, torch.nn.Sequential) else snet
-        if not hasattr(final, 'weight'):
-            print(f'  {name}  (no weight attr)')
+    print(f'cos gap by subgraph size k:')
+    for k_val in range(3, K.max().item() + 1):
+        km = K == k_val
+        if km.sum() < 5:
             continue
-        w = final.weight.data.squeeze()
-        top_pos = w.topk(min(8, w.size(0))).indices.tolist()
-        top_neg = (-w).topk(min(8, w.size(0))).indices.tolist()
-        print(f'  {name}  + dims: {top_pos}')
-        print(f'  {name}  - dims: {top_neg}')
+        zm_k = sample(km & mot_mask, k=200)
+        zb_k = sample(km & bg_mask,  k=200)
+        nm = (km & mot_mask).sum().item()
+        nb = (km & bg_mask).sum().item()
+        if zm_k.size(0) > 1 and zb_k.size(0) > 1:
+            mm_k = (zm_k @ zm_k.T).fill_diagonal_(float('nan')).nanmean().item()
+            mb_k = (zm_k @ zb_k.T).mean().item()
+            gap_k = mm_k - mb_k
+        else:
+            mm_k = mb_k = gap_k = float('nan')
+        print(f'  k={k_val:2d}  n_mot={nm:5d}  n_bg={nb:5d}  '
+              f'mm={mm_k:.4f}  mb={mb_k:.4f}  gap={gap_k:+.4f}')
+    print()
 
 
 if __name__ == '__main__':
