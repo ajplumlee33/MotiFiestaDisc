@@ -1,10 +1,8 @@
 #!/usr/bin/env python
 
 import sys
-import pickle
 import argparse
 
-import numpy as np
 import warnings
 warnings.simplefilter("ignore", UserWarning)
 
@@ -14,8 +12,8 @@ from MotiFiesta.training.loading import get_loader
 from MotiFiesta.training.train import motif_train
 from MotiFiesta.utils.learning_utils import dump_model_hparams
 from MotiFiesta.utils.learning_utils import load_model
-from MotiFiesta.utils.learning_utils import load_data
 from MotiFiesta.utils.learning_utils import make_dirs
+from MotiFiesta.utils.learning_utils import get_device
 
 
 FUNCTIONS = ['train', 'test', 'build', 'browse', 'eval']
@@ -31,83 +29,82 @@ print(f"== {function} mode ==")
 if function == 'train':
     parser = argparse.ArgumentParser()
     parser.add_argument("--name", "-n", type=str, default="default")
+    parser.add_argument("--mode", type=str, default="default", choices=["default", "disc"])
     parser.add_argument("--dataset", "-da", type=str, default='synthetic')
     parser.add_argument("--data_root", type=str, default='.')
-    parser.add_argument("--restart", "-r", action='store_true', default=False,  help='Restart model.')
-    parser.add_argument("--init-from", type=str, default=None, help='Load weights from this model name, start fresh optimizer and controller (staged training).')
-    parser.add_argument("--mode", "-md", default='combined',
-                        choices=['mot', 'sil', 'combined'],
-                        help='Loss mode. mot = density loss only, sil = sampling invariance loss only, combined = both.')
+    parser.add_argument("--restart", "-r", action='store_true', default=False)
 
+    # training loop
     parser.add_argument("--batch-size", "-b", type=int, default=16)
     parser.add_argument("--max-batches", "-m", type=int, default=-1)
-    parser.add_argument("--epochs", "-e", type=int, default=100)
-    parser.add_argument("--stop-epochs", type=int, default=30, help="Number of epochs to train embeddings before doing motifs.")
-    parser.add_argument("--attributed", default=False, action='store_true', help="Use attributed graphs. If False, use node degree as features.")
+    parser.add_argument("--epochs", "-e", type=int, default=25)
+    parser.add_argument("--stop-epochs", type=int, default=30)
+    parser.add_argument("--attributed", default=False, action='store_true')
 
 
     parser.add_argument("--lam",  type=float, default=1)
     parser.add_argument("--beta", type=float, default=1)
-    parser.add_argument("--estimator", "-es", type=str, default='knn', help="Which density estimator to use for the motif agg. step")
-    parser.add_argument("--n-neighbors", "-nn", type=int, default=30, help="Number of neighbors")
-    parser.add_argument("--volume", "-vv", action='store_true', default=False, help="Use d-sphere volume to normalize density with kNN.")
-    parser.add_argument('--edge-sample-rate', type=float, default=1.0)
-    parser.add_argument('--wl-iter', type=int, default=3, help="WL subtree iterations for rec_loss_wl")
-    parser.add_argument("--sil-momentum", type=float, default=0.95,
-                        help="EMA momentum for the sampling invariance tracker (higher = more stable targets)")
+    parser.add_argument("--estimator", "-es", type=str, default='knn')
+    parser.add_argument("--n-neighbors", "-nn", type=int, default=30)
+    parser.add_argument("--volume", "-vv", action='store_true', default=False)
 
-    parser.add_argument("--model-type", type=str, default='motifiesta',
-                        choices=['motifiesta', 'disc'],
-                        help="Model architecture: motifiesta (main branch) or disc (GINPool-based).")
-    parser.add_argument("--gin-pool-layers", type=int, default=1,
-                        help="GIN layers per GINPool level (disc model only).")
-    parser.add_argument("--wl-hops", type=int, default=1,
-                        help="Neighbor degree histogram hops prepended to node features (0=disable).")
+    # default-mode architecture
     parser.add_argument("--steps", "-s", type=int, default=5)
     parser.add_argument("--dim", "-d", type=int, default=8)
     parser.add_argument("--grad-clip", type=float, default=1.0,
                         help="Max gradient norm for clipping (0 to disable).")
     parser.add_argument("--pool-dummy", action="store_true", default=False)
-    parser.add_argument("--score-method", default="sigmoid", help="Edge scoring method: (sigmoid, softmax-neighbors, softmax-all)")
-    parser.add_argument("--merge-method", default="sum", help="Edge merge method: (sum, cat, set2set)")
-    parser.add_argument("--hard-embed", action='store_true', help="Whether to use hard embedding using degree histogram.")
-    parser.add_argument("--matching-mode", default="greedy", choices=["greedy", "luby"], help="Edge matching algorithm: greedy (sequential) or luby (parallel).")
-    parser.add_argument("--scoring-mode", default="mlp", choices=["mlp", "attention"], help="Edge scoring method: mlp or multi-head attention.")
-    parser.add_argument("--n-heads", type=int, default=4, help="Number of attention heads (only used when --scoring-mode=attention).")
-    parser.add_argument("--device", type=str, default=None, help="Force compute device: cpu, cuda, mps.")
-    parser.add_argument("--freeze-encoder", action="store_true", default=False,
-                        help="Freeze GIN/transforms, train edge_scorer only (stage-2 score training).")
-    parser.add_argument("--structural-loss-coef", type=float, default=1.0,
-                        help="Weight on structural_loss term (0=disable, 1=full). Use <1 to limit embedding over-generalization.")
+    parser.add_argument("--score-method", default="sigmoid")
+    parser.add_argument("--merge-method", default="sum")
+    parser.add_argument("--hard-embed", action='store_true')
 
-    # --- Synthetic single-graph dataset flags (used only when data_root --
-    # contains 'sys_synth'; silently ignored otherwise) -----------------------
-    parser.add_argument("--motif-type", type=str, default='clique',
-                        choices=['star', 'barbell', 'wheel', 'random',
-                                 'clique', 'lollipop'],
-                        help="Motif type to plant. Same names as "
-                             "synthetic.generate_instances.")
-    parser.add_argument("--motif-size", type=int, default=5,
-                        help="Motif size knob, interpreted by motif_menu "
-                             "(matches generate_instances semantics).")
-    parser.add_argument("--n-motifs", type=int, default=10,
-                        help="Number of motif instances to plant.")
-    parser.add_argument("--parent-size", type=int, default=1000,
-                        help="Parent graph size for SysSyntheticDataset.")
-    parser.add_argument("--parent-e-prob", type=float, default=0.005,
-                        help="Erdős-Rényi edge probability for the parent graph.")
-    parser.add_argument("--random-e-prob", type=float, default=None,
-                        help="Edge probability used when motif_type='random'. "
-                             "Defaults to parent-e-prob, but for single-graph "
-                             "mode the parent is sparse so random motifs end "
-                             "up empty — override to ~0.3-0.5 for visible "
-                             "random motifs.")
-    parser.add_argument("--distort-p", type=float, default=0.0,
-                        help="Per-edge distortion probability applied to each "
-                             "planted motif instance. 0.0 = exact topology.")
-    parser.add_argument("--dataset-seed", type=int, default=0,
-                        help="RNG seed for synthetic dataset generation. "
-                             "Separate from training RNG.")
+    # disc-mode args
+    parser.add_argument("--hidden-dim", type=int, default=64,
+                        help="gin hidden dimension (disc mode).")
+    parser.add_argument("--gin-layers", type=int, default=2,
+                        help="gin depth per induced subgraph (disc mode).")
+    parser.add_argument("--k", type=int, default=30,
+                        help="knn neighbors for freq_loss (disc mode).")
+    parser.add_argument("--k-max", type=int, default=12,
+                        help="maximum induced subgraph size (disc mode).")
+    parser.add_argument("--n-samples", type=int, default=50,
+                        help="random induced subgraphs sampled per graph per forward pass (disc mode).")
+    parser.add_argument("--wl-hops", type=int, default=0,
+                        help="wl neighbor-sum hops for full-graph feature augmentation (disc mode).")
+    parser.add_argument("--max-knn-size", type=int, default=-1,
+                        help="cap on kdtree reference set size in freq_loss (-1 = no cap).")
+    parser.add_argument("--warmup", type=int, default=0,
+                        help="epochs of rec_loss warmup before switching to freq_loss (disc mode).")
+    parser.add_argument("--freq-lr", type=float, default=1e-3,
+                        help="initial lr for freq_loss phase after warmup (disc mode).")
+    parser.add_argument("--sigma", type=float, default=0.5,
+                        help="gaussian kde bandwidth for freq_loss (disc mode).")
+    parser.add_argument("--pool", type=str, default="mean", choices=["mean", "anchor", "attn"],
+                        help="subgraph pooling: mean, anchor-only, or attention-weighted (disc mode).")
+    parser.add_argument("--tau", type=float, default=0.1)
+    parser.add_argument("--lr-patience", type=int, default=0,
+                        help="ReduceLROnPlateau patience for freq phase (0 = disabled).")
+    parser.add_argument("--freeze-gin", action='store_true', default=False,
+                        help="freeze gin after warmup; freq phase trains score_net only via freq_loss.")
+    parser.add_argument("--warmup-loss", type=str, default='ae',
+                        choices=['ae', 'rec', 'wwl', 'ae+wwl', 'infonce', 'walk_pair'],
+                        help="warmup loss: 'ae' = link prediction bce, 'rec' = shell mse, 'wwl' = wwl kernel mse, 'ae+wwl' = both, 'infonce' = nt-xent with wl hash labels.")
+    parser.add_argument("--dist-label", action='store_true', default=False,
+                        help="append one-hot bfs distance from seed (5 bins) to gin node features.")
+    parser.add_argument("--infonce-tau", type=float, default=0.1,
+                        help="temperature for infonce/nt-xent warmup loss.")
+    parser.add_argument("--ae-freq", action='store_true', default=False,
+                        help="freq phase: mix in 0.1 * ae_loss alongside freq_loss (default: freq_loss only).")
+    parser.add_argument("--ae-eps", type=float, default=0.0,
+                        help="label smoothing for ae_loss adjacency targets (0=off, 0.1-0.15 recommended).")
+    parser.add_argument("--wwl-freq", action='store_true', default=False,
+                        help="add wwl_loss to freq phase loss (alongside ae+freq) to maintain pairwise metric.")
+    parser.add_argument("--score-weight", action='store_true', default=False,
+                        help="weight knn density by neighbor scores (s_ref) — only valid with --estimator knn.")
+    parser.add_argument("--anneal-epochs", type=int, default=0,
+                        help="if >0, replace hard warmup with joint annealing: ae weight 1→ae-min-weight, freq weight 0→1 over this many epochs.")
+    parser.add_argument("--ae-min-weight", type=float, default=0.1,
+                        help="minimum ae loss weight at end of annealing schedule.")
 
     args, _ = parser.parse_known_args()
     print(args)
@@ -118,116 +115,133 @@ if function == 'train':
 
     make_dirs(args.name)
 
-    hparams = {'model':{
-                        'model_type': args.model_type,
-                        'dim': args.dim,
-                        'steps': args.steps,
-                        'pool_dummy': args.pool_dummy,
-                        'edge_score_method': args.score_method,
-                        'merge_method': args.merge_method,
-                        'hard_embed': args.hard_embed,
-                        'matching_mode': args.matching_mode,
-                        'scoring_mode': args.scoring_mode,
-                        'n_heads': args.n_heads,
-                        'gin_layers': args.gin_pool_layers,
-                        'wl_hops': args.wl_hops,
-                         },
-               'train': {
-                        'epochs': args.epochs,
-                        'batch_size': args.batch_size,
-                        'max_batches': args.max_batches,
-                        'dataset': args.dataset,
-                        'lambda': args.lam,
-                        'beta': args.beta,
-                        'stop_epochs': args.stop_epochs,
-                        'estimator': args.estimator,
-                        'k': args.n_neighbors,
-                        'volume': args.volume,
-                        'attributed': args.attributed,
-                        'mode': args.mode,
-                        'sil_momentum': args.sil_momentum,
-                        }
-                }
-
-    # Build synth-dataset kwargs only when the data_root asks for it.
-    # get_loader filters these to the keys SysSyntheticDataset accepts,
-    # so this is belt-and-suspenders — but keeping the build explicit
-    # makes the CLI's intent readable.
-    loader_extra = {}
-    if 'sys_synth' in args.data_root:
-        loader_extra['motif_type'] = args.motif_type
-        loader_extra['motif_size'] = args.motif_size
-        loader_extra['n_motifs'] = args.n_motifs
-        loader_extra['parent_size'] = args.parent_size
-        loader_extra['parent_e_prob'] = args.parent_e_prob
-        if args.random_e_prob is not None:
-            loader_extra['random_e_prob'] = args.random_e_prob
-        loader_extra['distort_p'] = args.distort_p
-        loader_extra['seed'] = args.dataset_seed
-        print(f">>> sys_synth kwargs: {loader_extra}")
-
     print(">>> loading data")
     data = get_loader(
-                      root=args.data_root if args.data_root != '.' else args.dataset,
-                      name=args.dataset,
-                      batch_size=hparams['train']['batch_size'],
-                      attributed=hparams['train']['attributed'],
-                      **loader_extra,
-                      )
-
-    hparams['model']['n_features'] = data['dataset_whole'].num_features
-    print(data['dataset_whole'].num_features)
-    dump_model_hparams(args.name, hparams)
+        name=args.dataset,
+        root=args.data_root,
+        batch_size=args.batch_size,
+        attributed=args.attributed if hasattr(args, 'attributed') else False,
+    )
+    n_features = data['dataset_whole'].num_features
+    print(n_features)
 
     print(">>> building model")
 
-    if args.restart:
-        print(f"Restarting training with ID: {args.name}")
-        model_dict = load_model(args.name)
-        model = model_dict['model']
-        epoch_start = model_dict['epoch']
-        optimizer = model_dict['optimizer']
-        controller_state = model_dict['controller_state_dict']
-    elif args.init_from:
-        print(f"Initializing weights from: {args.init_from}")
-        import json as _json
-        with open(f'models/{args.init_from}/hparams.json') as _f:
-            src_hparams = _json.load(_f)
-        # inherit source model arch so saved hparams match the actual weights
-        hparams['model'] = dict(src_hparams['model'])
-        hparams['model']['n_features'] = data['dataset_whole'].num_features
+    if args.mode == 'disc':
+        from MotiFiesta.disc.disc_model import MotiFiestaDisc
+        from MotiFiesta.disc.disc_train import disc_train
+        import torch
+        disc_hparams = {
+            'model_type':  'disc',
+            'hidden_dim':  args.hidden_dim,
+            'gin_layers':  args.gin_layers,
+            'k_max':       args.k_max,
+            'n_samples':   args.n_samples,
+            'wl_hops':     args.wl_hops,
+            'n_features':  n_features,
+            'pool':        args.pool,
+            'dist_label':  args.dist_label,
+        }
+        hparams = {'model': disc_hparams, 'train': {
+            'epochs':     args.epochs,
+            'batch_size': args.batch_size,
+            'k':          args.k,
+            'lam':        args.lam,
+            'beta':       args.beta,
+        }}
         dump_model_hparams(args.name, hparams)
-        model_dict = load_model(args.init_from)
-        model = model_dict['model']
-        epoch_start, optimizer, controller_state = 0, None, None
+        if args.restart:
+            print(f"restarting training with id: {args.name}")
+            ckpt = torch.load(f'models/{args.name}/{args.name}.pth', map_location='cpu',
+                              weights_only=False)
+            model = MotiFiestaDisc(**disc_hparams)
+            model.load_state_dict(ckpt['model_state_dict'])
+            epoch_start = ckpt['epoch'] + 1
+            best_loss = ckpt.get('best_loss', float('inf'))
+            # if restarting past the warmup boundary, use freq_lr for a fresh optimizer
+            # rather than loading saved momentum which may cause bouncing
+            if epoch_start > args.warmup and args.freq_lr != 1e-3:
+                optimizer = torch.optim.Adam(model.parameters(), lr=args.freq_lr)
+            else:
+                optimizer = torch.optim.Adam(model.parameters())
+                optimizer.load_state_dict(ckpt['optimizer_state_dict'])
+            scheduler_state = ckpt.get('scheduler_state_dict')
+        else:
+            model = MotiFiestaDisc(**disc_hparams)
+            epoch_start, optimizer, best_loss, scheduler_state = 0, None, float('inf'), None
+        print(model)
+        print(">>> training...")
+        disc_train(
+            model,
+            train_loader=data['loader_train'],
+            test_loader=data['loader_test'],
+            model_name=args.name,
+            epochs=args.epochs,
+            max_batches=args.max_batches,
+            n_neighbors=args.k,
+            beta=args.beta,
+            lam=args.lam,
+            epoch_start=epoch_start,
+            best_loss=best_loss,
+            optimizer=optimizer,
+            warmup=args.warmup,
+            freq_lr=args.freq_lr,
+            sigma=args.sigma,
+            tau=args.tau,
+            lr_patience=args.lr_patience,
+            max_knn_size=args.max_knn_size,
+            freeze_gin=args.freeze_gin,
+            warmup_loss=args.warmup_loss,
+            ae_freq=args.ae_freq,
+            ae_eps=args.ae_eps,
+            wwl_freq=args.wwl_freq,
+            score_weight=args.score_weight,
+            scheduler_state=scheduler_state,
+            anneal_epochs=args.anneal_epochs,
+            ae_min_weight=args.ae_min_weight,
+            infonce_tau=args.infonce_tau,
+        )
     else:
-        if args.model_type == 'disc':
-            model = MotiFiestaDisc(**hparams['model'])
+        hparams = {'model': {
+            'dim': args.dim, 'steps': args.steps, 'pool_dummy': args.pool_dummy,
+            'edge_score_method': args.score_method, 'merge_method': args.merge_method,
+            'hard_embed': args.hard_embed, 'gin_layers': args.gin_layers,
+            'n_features': n_features,
+        }, 'train': {
+            'epochs': args.epochs, 'batch_size': args.batch_size,
+            'max_batches': args.max_batches, 'dataset': args.dataset,
+            'lambda': args.lam, 'beta': args.beta, 'stop_epochs': args.stop_epochs,
+            'estimator': args.estimator, 'k': args.n_neighbors,
+            'volume': args.volume, 'attributed': args.attributed,
+        }}
+        dump_model_hparams(args.name, hparams)
+        if args.restart:
+            print(f"restarting training with id: {args.name}")
+            model_dict = load_model(args.name)
+            model = model_dict['model']
+            epoch_start = model_dict['epoch']
+            optimizer = model_dict['optimizer']
+            controller_state = model_dict['controller_state_dict']
         else:
             model = MotiFiestaModel(**hparams['model'])
-        epoch_start, optimizer, controller_state = 0, None, None
-    print(model)
+            epoch_start, optimizer, controller_state = 0, None, None
+        print(model)
+        print(">>> training...")
+        motif_train(model,
+                    train_loader=data['loader_train'],
+                    test_loader=data['loader_test'],
+                    model_name=args.name,
+                    epochs=args.epochs,
+                    max_batches=args.max_batches,
+                    stop_epochs=args.stop_epochs,
+                    estimator=args.estimator,
+                    volume=args.volume,
+                    n_neighbors=args.n_neighbors,
+                    hard_embed=args.hard_embed,
+                    beta=args.beta,
+                    lam=args.lam,
+                    epoch_start=epoch_start,
+                    optimizer=optimizer,
+                    controller_state=controller_state)
 
-    print(">>> training...")
-    motif_train(model,
-                train_loader=data['loader_train'],
-                test_loader=data['loader_test'],
-                model_name=args.name,
-                epochs=args.epochs,
-                max_batches=args.max_batches,
-                stop_epochs=args.stop_epochs,
-                estimator=args.estimator,
-                volume=args.volume,
-                n_neighbors=args.n_neighbors,
-                hard_embed=args.hard_embed,
-                beta=args.beta,
-                lam=args.lam,
-                epoch_start=epoch_start,
-                optimizer=optimizer,
-                controller_state=controller_state,
-                edge_sample_rate=args.edge_sample_rate,
-                wl_iter=args.wl_iter,
-                freeze_encoder=args.freeze_encoder,
-                structural_loss_coef=args.structural_loss_coef,
-                grad_clip=args.grad_clip if args.grad_clip > 0 else None,
-                )
+import sys; sys.exit(0)

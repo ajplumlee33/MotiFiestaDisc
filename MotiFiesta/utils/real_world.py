@@ -27,7 +27,12 @@ import torch
 import torch.nn.functional as F
 import torch_geometric.transforms as T
 from torch_geometric.data import Dataset
-from torch_geometric.datasets import TUDataset
+from torch_geometric.datasets import TUDataset as _TUDataset
+
+class TUDataset(_TUDataset):
+    """suppress download — raw files are expected to be pre-placed."""
+    def download(self):
+        pass
 from torch_geometric.data import Data, DataLoader
 from torch_geometric.utils import from_networkx
 from torch_geometric.utils import to_networkx
@@ -51,9 +56,9 @@ def rewire(g_pyg, n_iter=100):
 
     rewired_g.remove_edges_from(list(nx.selfloop_edges(rewired_g)))
     if has_features:
-        rewired_pyg = from_networkx(g_nx, group_node_attrs=['x'])
+        rewired_pyg = from_networkx(rewired_g, group_node_attrs=['x'])
     else:
-        rewired_pyg = from_networkx(g_nx)
+        rewired_pyg = from_networkx(rewired_g)
     return rewired_pyg
 
 
@@ -80,7 +85,7 @@ class RealWorldDataset(Dataset):
         self.max_degree = max_degree
         self.n_features = n_features
 
-        super(RealWorldDataset, self).__init__("data/"+root, transform)
+        super(RealWorldDataset, self).__init__("data/"+root+"_pairs", transform)
 
     @property
     def processed_file_names(self):

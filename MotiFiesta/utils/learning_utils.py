@@ -5,23 +5,19 @@ import torch
 
 device_cache = None
 
-def set_device(device):
-    """override device selection. call before training to lock in a device."""
-    global device_cache
-    device_cache = torch.device(device) if not isinstance(device, torch.device) else device
-
 def get_device():
-    """return the active compute device: cuda > mps > cpu."""
     global device_cache
-    if device_cache is not None:
-        return device_cache
-    if torch.cuda.is_available():
-        device_cache = torch.device("cuda")
-    elif torch.backends.mps.is_available():
-        device_cache = torch.device("mps")
-    else:
-        device_cache = torch.device("cpu")
-    print(f"using device: {device_cache}")
+    if device_cache is None:
+        override = os.environ.get("MOTIFIESTA_DEVICE", "").strip()
+        if override:
+            device_cache = torch.device(override)
+        elif torch.cuda.is_available():
+            device_cache = torch.device("cuda")
+        elif torch.backends.mps.is_available():
+            device_cache = torch.device("mps")
+        else:
+            device_cache = torch.device("cpu")
+        print(f"using device: {device_cache}")
     return device_cache
 
 def load_data(run, batch_size=2, background_only=False):
