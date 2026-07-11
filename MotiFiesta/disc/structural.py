@@ -94,12 +94,6 @@ def _tree_features(nx_graph, nodes=None, dim=None, node_feats=None, **kwargs):
                            deg_pad]).astype(np.float32)
 
 
-def _iso_certificate(nx_graph, **kwargs):
-    """przulj isomorphism class certificate via sorted per-node (degree, triangle) pairs."""
-    tri = nx.triangles(nx_graph)
-    return tuple(sorted((d, tri[n]) for n, d in nx_graph.degree()))
-
-
 def _to_nx(nodes, adj):
     nm = {v: i for i, v in enumerate(nodes)}
     G  = nx.Graph()
@@ -125,7 +119,7 @@ def main():
     p.add_argument('--hash-dim',    type=int, default=16)
     p.add_argument('--embed-dim',   type=int, default=32)
     p.add_argument('--n-graphs',    type=int, default=0)
-    p.add_argument('--embed-mode',  default='wl', choices=['wl', 'wwl', 'spectral', 'tree', 'canonical'])
+    p.add_argument('--embed-mode',  default='wl', choices=['wl', 'wwl', 'spectral', 'tree'])
     p.add_argument('--score-alpha', type=float, default=1.5)
     p.add_argument('--clf',         default='auto', choices=['auto', 'lda', 'tree'])
     p.add_argument('--tree-depth',  type=int, default=5)
@@ -144,68 +138,65 @@ def main():
     if args.n_graphs > 0:
         all_graphs = all_graphs[:args.n_graphs]
     n_g = len(all_graphs)
-    print(f"\n=== {args.name}  n_graphs={n_g}  k=[{args.k_min},{args.k_max}]"
-          f"  hash_dim={args.hash_dim}  embed_dim={args.embed_dim} ===\n")
+    split = int(0.8 * n_g)
+    train_graphs = all_graphs[:split]
+    test_graphs  = all_graphs[split:]
+    print(f"\n=== {args.name}  n_graphs={n_g}  train={len(train_graphs)}  test={len(test_graphs)}"
+          f"  k=[{args.k_min},{args.k_max}]  hash_dim={args.hash_dim}  embed_dim={args.embed_dim} ===\n")
 
     embed_fn = {'wwl': _wwl_embed, 'spectral': _spectral_embed,
                 'tree': _tree_features}.get(args.embed_mode, _wl_embed)
 
-    # collect subgraph embeddings from pos and neg graphs
-    raw_graph_subs      = []
-    Z_pos_list          = []
-    Z_neg_list          = []
-    Z_pos_sizes         = []
-    Z_neg_sizes         = []
-    pos_canon_per_graph = []
-    neg_canon_per_graph = []
+    # fitting pass: collect embeddings from train graphs (pos + neg)
+    Z_pos_list  = []
+    Z_neg_list  = []
+    Z_pos_sizes = []
+    Z_neg_sizes = []
 
-    for idx, pair in enumerate(all_graphs):
-        g_pos   = pair['pos']
-        n_pos   = len(g_pos.x)
-        adj_pos = build_adj(g_pos.edge_index.cpu(), n_pos)
-        tru     = set(g_pos.motif_id.nonzero(as_tuple=False).squeeze(-1).tolist())
-        x_pos   = g_pos.x.numpy()
+    if not args.load_model:
+        for idx, pair in enumerate(train_graphs):
+            g_pos   = pair['pos']
+            adj_pos = build_adj(g_pos.edge_index.cpu(), len(g_pos.x))
+            x_pos   = g_pos.x.numpy()
+            for ns in sample(adj_pos, len(g_pos.x), args.n_samples, args.k_min, args.k_max):
+                z = embed_fn(_to_nx(ns, adj_pos), ns, dim=args.embed_dim, node_feats=x_pos)
+                Z_pos_list.append(z); Z_pos_sizes.append(len(ns))
 
-        subs = []
-        for ns in sample(adj_pos, n_pos, args.n_samples, args.k_min, args.k_max):
-            nx_g = _to_nx(ns, adj_pos)
-            if args.embed_mode == 'canonical':
-                z = _iso_certificate(nx_g)
-            else:
-                z = embed_fn(nx_g, ns, dim=args.embed_dim, node_feats=x_pos)
-                Z_pos_list.append(z)
-                Z_pos_sizes.append(len(ns))
-            subs.append((ns, z))
-        raw_graph_subs.append((tru, adj_pos, subs))
-
-        if not args.load_model:
             g_neg   = pair['neg']
             adj_neg = build_adj(g_neg.edge_index.cpu(), len(g_neg.x))
             x_neg   = g_neg.x.numpy()
-            neg_types = {}
             for ns in sample(adj_neg, len(g_neg.x), args.n_samples, args.k_min, args.k_max):
-                nx_g = _to_nx(ns, adj_neg)
-                if args.embed_mode == 'canonical':
-                    z = _iso_certificate(nx_g)
-                    neg_types[z] = neg_types.get(z, 0) + 1
-                else:
-                    z = embed_fn(nx_g, ns, dim=args.embed_dim, node_feats=x_neg)
-                    Z_neg_list.append(z)
-                    Z_neg_sizes.append(len(ns))
-            if args.embed_mode == 'canonical':
-                neg_canon_per_graph.append(neg_types)
+                z = embed_fn(_to_nx(ns, adj_neg), ns, dim=args.embed_dim, node_feats=x_neg)
+                Z_neg_list.append(z); Z_neg_sizes.append(len(ns))
+
+            if (idx + 1) % 100 == 0:
+                print(f"  train {idx+1}/{len(train_graphs)}", flush=True)
+
+        if Z_pos_list:
+            args.embed_dim = np.array(Z_pos_list).shape[1]
+
+    # evaluation pass: collect embeddings from test graphs (pos only)
+    test_subs = []
+    true_sets = []
+    adjs      = []
+    for idx, pair in enumerate(test_graphs):
+        g_pos   = pair['pos']
+        adj_pos = build_adj(g_pos.edge_index.cpu(), len(g_pos.x))
+        tru     = set(g_pos.motif_id.nonzero(as_tuple=False).squeeze(-1).tolist())
+        x_pos   = g_pos.x.numpy()
+        subs = [
+            (ns, embed_fn(_to_nx(ns, adj_pos), ns, dim=args.embed_dim, node_feats=x_pos))
+            for ns in sample(adj_pos, len(g_pos.x), args.n_samples, args.k_min, args.k_max)
+        ]
+        test_subs.append(subs)
+        true_sets.append(tru)
+        adjs.append(adj_pos)
 
         if (idx + 1) % 100 == 0:
-            print(f"  processed {idx+1}/{n_g}", flush=True)
+            print(f"  test {idx+1}/{len(test_graphs)}", flush=True)
 
     if args.embed_mode != 'canonical' and Z_pos_list:
         args.embed_dim = np.array(Z_pos_list).shape[1]
-
-    if args.embed_mode == 'canonical':
-        pos_canon_per_graph = [
-            {z: sum(1 for _, zz in subs if zz == z) for z in set(zz for _, zz in subs)}
-            for _, _, subs in raw_graph_subs
-        ]
 
     # fit or load
     if args.load_model:
@@ -213,22 +204,18 @@ def main():
     else:
         planes, tree_clf, r_pos, r_neg, bucket_score = fit(
             Z_pos_list, Z_neg_list, Z_pos_sizes, Z_neg_sizes,
-            pos_canon_per_graph, neg_canon_per_graph, args
+            [], [], args
         )
         if args.save_model:
             save_model(args.save_model, planes, tree_clf, bucket_score, r_pos, r_neg)
 
-    # assign buckets and evaluate
+    # assign test subgraphs to buckets and evaluate
     def _bucket(z):
-        if args.embed_mode == 'canonical':
-            return z
         if tree_clf is not None:
             return int(tree_clf.apply(z.reshape(1, -1))[0])
         return simhash(z, planes)
 
-    graph_subs = [[(ns, _bucket(z)) for ns, z in subs] for _, _, subs in raw_graph_subs]
-    true_sets  = [tru for tru, _, _ in raw_graph_subs]
-    adjs       = [adj for _, adj, _ in raw_graph_subs]
+    graph_subs = [[(ns, _bucket(z)) for ns, z in subs] for subs in test_subs]
 
     eval_jaccard(graph_subs, true_sets, adjs, bucket_score, r_pos,
                  args.top_k, args.pred_mode, args.cc_filter)

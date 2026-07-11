@@ -7,9 +7,15 @@ This repository is forked from the MotiFiesta algorithm repository described in 
 
 [![](http://img.shields.io/badge/cs.LG-arXiv%3A2206.01008-B31B1B.svg)][1]
 
-## Architecture:
+## MotiFiesta
 
-![Architecture diagram](discovery.png)
+![MotiFiesta](figs/arch_motifiesta.png)
+
+## Discovery Experiments
+
+![rand-esu + WL hash + LDA + simhash](figs/arch_structural_disc.png)
+
+![rand-esu + Prżulj certificate + freq. score](figs/arch_canonical_disc.png)
 
 ## Setup
 
@@ -20,19 +26,14 @@ $ pip install .
 ## Build dataset
 
 ```
-$ python MotiFiesta/utils/gen_synth.py barbell
+$ python MotiFiesta/disc/gen_synth.py barbell
 ```
 
-## Train a model
+## Run discovery
 
 ```
-$ scripts/motifiesta train --mode disc --name barbell-disc --dataset synth-barbell-k10 -e 10
-```
-
-## Decode
-
-```
-$ python MotiFiesta/training/disc_decode.py --name barbell-disc --data synth-barbell-k10
+$ python MotiFiesta/disc/structural.py --name barbell-structural --data data/synth-barbell-k10 --dataset synth_pairs
+$ python MotiFiesta/disc/canonical.py --name barbell-canonical --data data/synth-barbell-k10 --dataset synth_pairs
 ```
 
 [1]: https://arxiv.org/abs/2206.01008
