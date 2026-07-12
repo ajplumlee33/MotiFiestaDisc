@@ -170,7 +170,7 @@ def score_knn(Z_pos_list, Z_neg_list, Z_pos_sizes, Z_neg_sizes, planes, knn_k):
 
 def fit(Z_pos_list, Z_neg_list, Z_pos_sizes, Z_neg_sizes,
         pos_canon_per_graph, neg_canon_per_graph, args):
-    """fit classifier + compute bucket scores. returns (planes, tree_clf, r_pos, r_neg, bucket_score)."""
+    """fit classifier and compute bucket scores. returns (planes, tree_clf, r_pos, r_neg, bucket_score)."""
     from sklearn.tree import DecisionTreeClassifier
 
     Z_pos = np.array(Z_pos_list, dtype=np.float32) if Z_pos_list else None
@@ -179,8 +179,8 @@ def fit(Z_pos_list, Z_neg_list, Z_pos_sizes, Z_neg_sizes,
     planes   = None
 
     if args.embed_mode == 'canonical':
-        n_pos_g = len(pos_canon_per_graph)
-        n_neg_g = len(neg_canon_per_graph)
+        n_pos_g   = len(pos_canon_per_graph)
+        n_neg_g   = len(neg_canon_per_graph)
         all_types = set(t for g in pos_canon_per_graph for t in g)
         r_pos = collections.Counter({t: sum(g[t] for g in pos_canon_per_graph) for t in all_types})
         r_neg = collections.Counter({t: sum(g[t] for g in neg_canon_per_graph) for t in all_types})
@@ -192,8 +192,7 @@ def fit(Z_pos_list, Z_neg_list, Z_pos_sizes, Z_neg_sizes,
         print(f"  isomorphism classes (przulj certificate): {len(all_types)} distinct")
         return planes, tree_clf, r_pos, r_neg, bucket_score
 
-    use_tree_clf = args.clf == 'tree' or (args.clf == 'auto' and args.embed_mode == 'tree')
-    if use_tree_clf:
+    if args.clf == 'tree':
         X = np.vstack([Z_pos, Z_neg])
         y = np.array([1] * len(Z_pos_list) + [0] * len(Z_neg_list))
         tree_clf = DecisionTreeClassifier(
@@ -203,28 +202,19 @@ def fit(Z_pos_list, Z_neg_list, Z_pos_sizes, Z_neg_sizes,
         print(f"  tree depth={args.tree_depth}  leaves={tree_clf.get_n_leaves()}")
         r_pos = collections.Counter(tree_clf.apply(Z_pos).tolist())
         r_neg = collections.Counter(tree_clf.apply(Z_neg).tolist())
+        bucket_score = score_gstat(r_pos, r_neg) if args.score == 'gstat' else score_count(r_pos, r_neg, args.score_alpha)
     else:
-        if args.proj == 'lda':
-            planes, separation = fit_planes(Z_pos, Z_neg, args.hash_dim, args.embed_dim)
-            print(f"  lda class separation (fisher): {separation:.3f}")
-        else:
-            n_components = min(args.hash_dim, Z_pos.shape[0], Z_pos.shape[1])
-            pca = PCA(n_components=n_components, random_state=42)
-            pca.fit(Z_pos)
-            planes = pca.components_
-            print(f"  pca variance explained: {pca.explained_variance_ratio_.sum():.3f}")
+        planes, separation = fit_planes(Z_pos, Z_neg, args.hash_dim, args.embed_dim)
+        print(f"  lda class separation (fisher): {separation:.3f}")
         r_pos = collections.defaultdict(int)
         r_neg = collections.defaultdict(int)
         for z in Z_pos_list: r_pos[simhash(z, planes)] += 1
         for z in Z_neg_list: r_neg[simhash(z, planes)] += 1
-
-    if args.score_mode == 'knn':
-        bucket_score = score_knn(Z_pos_list, Z_neg_list, Z_pos_sizes, Z_neg_sizes, planes, args.knn_k)
-        print(f"  knn scoring (k={args.knn_k}): {len(bucket_score)} buckets")
-    elif args.score_mode == 'gstat':
-        bucket_score = score_gstat(r_pos, r_neg)
-    else:
-        bucket_score = score_count(r_pos, r_neg, args.score_alpha)
+        if args.clf == 'knn':
+            bucket_score = score_knn(Z_pos_list, Z_neg_list, Z_pos_sizes, Z_neg_sizes, planes, args.knn_k)
+            print(f"  knn scoring (k={args.knn_k}): {len(bucket_score)} buckets")
+        else:
+            bucket_score = score_gstat(r_pos, r_neg) if args.score == 'gstat' else score_count(r_pos, r_neg, args.score_alpha)
 
     return planes, tree_clf, r_pos, r_neg, bucket_score
 
